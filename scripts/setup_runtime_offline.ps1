@@ -84,7 +84,10 @@ try {
     }
 
     Set-Content -Path (Join-Path $InstallDir "offline.mode") -Value "1" -Encoding ASCII
-    [Environment]::SetEnvironmentVariable("JARVIS_TTS_BACKEND", "sapi", "User")
+    # Offline voice uses SAPI via launch_assistance.vbs only — do not set a user-wide env var.
+    if ([Environment]::GetEnvironmentVariable("JARVIS_TTS_BACKEND", "User") -eq "sapi") {
+        [Environment]::SetEnvironmentVariable("JARVIS_TTS_BACKEND", $null, "User")
+    }
 
     if (-not $SkipStartup) {
         Write-Log "Adding to Windows startup"

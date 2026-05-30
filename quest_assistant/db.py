@@ -107,6 +107,14 @@ class QuestDB:
             rows = cur.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
         return [self._row_to_task(r) for r in rows]
 
+    def get_open_task_by_number(self, number: int) -> Optional[Task]:
+        if number < 1:
+            return None
+        tasks = self.list_tasks(status="open")
+        if number > len(tasks):
+            return None
+        return tasks[number - 1]
+
     def find_open_by_title_contains(self, needle: str, limit: int = 10) -> list[Task]:
         cur = self._conn.cursor()
         rows = cur.execute(

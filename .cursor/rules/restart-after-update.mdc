@@ -1,0 +1,19 @@
+---
+description: Restart Assistance automatically after code changes to quest_assistant
+globs: quest_assistant/**/*
+alwaysApply: false
+---
+
+# Restart Assistance after updates
+
+When you finish editing files under `quest_assistant/` (or related launch/runtime scripts that affect the running app), **automatically restart the local dev instance** without waiting for the user to ask.
+
+Run from the project root:
+
+```powershell
+.\scripts\restart_assistance.ps1
+```
+
+Do this at the end of the same turn where meaningful app behavior changed (voice, UI, parser, LLM, startup, etc.). Skip restart for docs-only or build-only changes unless the user is actively testing the app.
+
+Do not ask the user to restart manually unless the restart script fails.

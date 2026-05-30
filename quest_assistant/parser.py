@@ -10,8 +10,10 @@ import dateparser
 
 @dataclass(frozen=True)
 class ParsedAction:
-    kind: str  # "add" | "add_done" | "complete" | "delete" | "show" | "hide" | "listen_off" | "quit" | "noop"
+    kind: str  # "add" | "add_done" | "complete" | "delete" | "show" | "hide" | "listen_off" | "quit" | "set_fx" | "noop"
     title: Optional[str] = None
+    quest_number: Optional[int] = None
+    value: Optional[str] = None
     due_iso: Optional[str] = None
     raw: Optional[str] = None
 
@@ -38,14 +40,62 @@ _RE_ADD_PREFIX = re.compile(
     r")\s*(?:(?:a|the|some|those|these|this|one)\s+)?(?:quests?|missions?|tasks?)?\s*:?\s*",
     re.IGNORECASE,
 )
+_RE_ADD_BODY_PLACEHOLDER = re.compile(
+    r"^(?:"
+    r"(?:another|next|one\s+more)\s+(?:quest|mission|task|one)?|"
+    r"(?:a|the|some|new)\s+(?:quest|mission|task)?"
+    r")\.?\s*$",
+    re.IGNORECASE,
+)
 _RE_AT_TIME = re.compile(r"\b(at|@)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.IGNORECASE)
 _RE_MARK_DONE = re.compile(
-    r"^\s*mark(?:\s+the)?(?:\s+quest)?\s+(?P<title>.+?)\s+(?:as\s+)?(?:done|complete|finished)\s*$",
+    r"^\s*mark(?:\s+(?:the|task|quest|mission))?\s+(?P<title>.+?)\s+(?:as\s+)?(?:done|complete|completed|finished)\s*$",
+    re.IGNORECASE,
+)
+_RE_MARK_DONE_BY_NUM = re.compile(
+    r"^\s*mark(?:\s+(?:the))?\s*"
+    r"(?:(?:task|quest|mission)\s+)?"
+    r"(?P<num>\d+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
+    r"one|two|three|four|five|six|seven|eight|nine|ten)"
+    r"(?:\s*(?:st|nd|rd|th))?"
+    r"(?:\s*(?:task|quest|mission))?"
+    r"\s+(?:as\s+)?(?:done|complete|completed|finished)\s*$",
+    re.IGNORECASE,
+)
+_RE_COMPLETE_BY_NUM = re.compile(
+    r"^\s*(?:complete|finish|done)\s+(?:(?:task|quest|mission)\s+)?#?(?P<num>\d+)\s*$",
+    re.IGNORECASE,
+)
+_RE_DELETE_BY_NUM = re.compile(
+    r"^\s*(?:delete|remove)\s+(?:(?:task|quest|mission)\s+)?#?(?P<num>\d+)\s*$",
     re.IGNORECASE,
 )
 _RE_DONE_PREFIX = re.compile(r"^\s*(done|complete|finish)\b", re.IGNORECASE)
 _RE_SHOW = re.compile(r"^\s*(?:hey\s+)?(wake\s*up|open\s*up|show|appear)\b", re.IGNORECASE)
 _RE_HIDE = re.compile(r"^\s*(sleep|go\s*away|hide|disappear|close)\b", re.IGNORECASE)
+_RE_HIDE_INTENTS = (
+    re.compile(
+        r"^\s*(?:please\s+|just\s+|can\s+you\s+)?"
+        r"(?:sleep|go\s*away|hide(?:\s+yourself)?|disappear|close(?:\s+(?:up|it|yourself))?|dismiss|minimize(?:\s+yourself)?)"
+        r"(?:\s+(?:now|please))?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?:please\s+|just\s+|can\s+you\s+)?"
+        r"(?:sleep|go\s*away|hide(?:\s+yourself)?|disappear|close(?:\s+(?:up|it|yourself))?|dismiss|minimize(?:\s+yourself)?)\b",
+        re.IGNORECASE,
+    ),
+)
+_RE_QUIT = re.compile(r"^\s*(quit|exit|shutdown)\b", re.IGNORECASE)
+_RE_SHUT_DOWN = re.compile(
+    r"^\s*(?:please\s+|just\s+)?(?:shut\s*down|shutdown)"
+    r"(?:\s+(?:assistance|jarvis|the\s+app|application|now|please))?\s*$",
+    re.IGNORECASE,
+)
+_RE_QUIT_EXPLICIT = re.compile(
+    r"\b(?:quit|exit|shutdown|shut\s*down)\s+(?:assistance|jarvis|the\s+app|application)\b",
+    re.IGNORECASE,
+)
 _RE_LISTEN_OFF = re.compile(
     r"^\s*("
     r"stop\s+listening|"
@@ -57,7 +107,6 @@ _RE_LISTEN_OFF = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_RE_QUIT = re.compile(r"^\s*(quit|exit|shutdown)\b", re.IGNORECASE)
 _RE_ENUM_MARKER = re.compile(
     r"\b(?:"
     r"(?:and\s+)?(?:the\s+)?(?:next|another)\s+(?:one|quest|mission|task)?|"
@@ -112,7 +161,9 @@ def extract_add_titles(text: str) -> list[str]:
     if not raw or not has_add_intent(raw):
         return []
 
-    body = _RE_ADD_PREFIX.sub("", raw, count=1).strip()
+    body = _RE_ADD_PREFIX.sub("", raw, count=1).strip(" .,:;-")
+    if not body or _RE_ADD_BODY_PLACEHOLDER.match(body):
+        return []
     return extract_quest_titles(body)
 
 
@@ -138,6 +189,152 @@ def has_numbered_quest_markers(text: str) -> bool:
 
 def has_add_intent(text: str) -> bool:
     return bool(_RE_ADD_INTENT.search(text or ""))
+
+
+_QUEST_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
+
+
+def parse_quest_number(token: str) -> Optional[int]:
+    cleaned = (token or "").strip().lower()
+    if not cleaned:
+        return None
+    if cleaned.isdigit():
+        value = int(cleaned)
+        return value if value > 0 else None
+    return _QUEST_NUMBER_WORDS.get(cleaned)
+
+
+_RE_FX_CLASS = r"(?:fx|effects|visuals?)"
+_RE_FX_MODIFIER = r"(?:(?:the|your|my)\s+)?(?:ai\s+)?"
+_RE_FX_ON_OFF = (
+    re.compile(
+        rf"\b(?:turn|switch|toggle)\s+{_RE_FX_MODIFIER}{_RE_FX_CLASS}\s+(?P<state>on|off)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?:turn|switch|toggle)\s+(?P<state>on|off)\s+{_RE_FX_MODIFIER}{_RE_FX_CLASS}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b(?P<state>enable|disable)\s+{_RE_FX_MODIFIER}{_RE_FX_CLASS}\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^{_RE_FX_MODIFIER}{_RE_FX_CLASS}\s+(?P<state>on|off)\s*$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def parse_hide_intent(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw or parse_quit_intent(text):
+        return False
+    if _RE_HIDE.match(raw):
+        return True
+    return any(pattern.search(raw) for pattern in _RE_HIDE_INTENTS)
+
+
+def parse_quit_intent(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _RE_QUIT.match(raw):
+        return True
+    if _RE_SHUT_DOWN.match(raw):
+        return True
+    return bool(_RE_QUIT_EXPLICIT.search(raw))
+
+
+def parse_fx_enabled(text: str) -> Optional[bool]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    for index, pattern in enumerate(_RE_FX_ON_OFF):
+        match = pattern.search(raw) if index < 3 else pattern.match(raw)
+        if not match:
+            continue
+        state = match.group("state").lower()
+        if state in {"on", "off"}:
+            return state == "on"
+        return state == "enable"
+    return None
+
+
+_RE_FX_TOPIC = re.compile(
+    r"\b(?:ai\s*)?(?:fx|effects?|visuals?|animations?|glow(?:ing)?|flashy|fancy)\b",
+    re.IGNORECASE,
+)
+_RE_ON_HINT = re.compile(
+    r"\b(?:on|enable|start|turn\s+on|switch\s+on|activate)\b",
+    re.IGNORECASE,
+)
+_RE_OFF_HINT = re.compile(
+    r"\b(?:off|disable|stop|turn\s+off|switch\s+off|deactivate|quiet)\b",
+    re.IGNORECASE,
+)
+
+
+def infer_casual_intent(text: str) -> Optional[ParsedAction]:
+    """
+    Soft fallback when the LLM is unavailable: infer likely intent from casual speech.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    if (
+        parse_fx_enabled(raw) is not None
+        or parse_hide_intent(raw)
+        or parse_quit_intent(raw)
+        or parse_action(raw, allow_implicit_add=False).kind not in {"noop", "add"}
+    ):
+        return None
+
+    lower = raw.lower()
+
+    if _RE_FX_TOPIC.search(raw) or re.search(r"\b(?:look\s+cool|make\s+it\s+cool|pretty\s+lights?)\b", lower):
+        wants_on = bool(
+            _RE_ON_HINT.search(raw)
+            or re.search(r"\b(?:look\s+cool|make\s+it\s+cool|more\s+flashy|prettier)\b", lower)
+        )
+        wants_off = bool(_RE_OFF_HINT.search(raw))
+        if wants_on and not wants_off:
+            return ParsedAction(kind="set_fx", value="on", raw=text)
+        if wants_off and not wants_on:
+            return ParsedAction(kind="set_fx", value="off", raw=text)
+
+    if re.search(r"\b(?:come\s+back|where\s+are\s+you|show\s+yourself|need\s+you\s+back)\b", lower):
+        return ParsedAction(kind="show", raw=text)
+
+    if re.search(r"\b(?:get\s+out\s+of\s+(?:the\s+)?way|move\s+aside|can(?:'|no)?t\s+see)\b", lower):
+        return ParsedAction(kind="hide", raw=text)
+
+    if re.search(r"\b(?:stop\s+listening|don(?:'|o)?t\s+listen|privacy\s+mode|mute\s+(?:the\s+)?mic)\b", lower):
+        return ParsedAction(kind="listen_off", raw=text)
+
+    return None
 
 
 def split_into_items(text: str) -> list[str]:
@@ -231,13 +428,13 @@ def parse_action(text: str, *, allow_implicit_add: bool = True) -> ParsedAction:
     if not raw:
         return ParsedAction(kind="noop", raw=text)
 
-    if _RE_QUIT.match(raw):
+    if parse_quit_intent(raw):
         return ParsedAction(kind="quit", raw=text)
 
     if _RE_SHOW.match(raw):
         return ParsedAction(kind="show", raw=text)
 
-    if _RE_HIDE.match(raw):
+    if parse_hide_intent(raw):
         return ParsedAction(kind="hide", raw=text)
 
     if _RE_LISTEN_OFF.match(raw):
@@ -246,15 +443,34 @@ def parse_action(text: str, *, allow_implicit_add: bool = True) -> ParsedAction:
     if _RE_ADD_DONE.match(raw):
         return ParsedAction(kind="add_done", raw=text)
 
+    m = _RE_DELETE_BY_NUM.match(raw)
+    if m:
+        number = parse_quest_number(m.group("num"))
+        if number:
+            return ParsedAction(kind="delete", quest_number=number, raw=text)
+
     if _RE_DELETE.match(raw):
         title = _RE_DELETE.sub("", raw, count=1).strip(" :.-")
         title = re.sub(r"^\s*quest\b", "", title, flags=re.IGNORECASE).strip(" :.-")
         return ParsedAction(kind="delete", title=title or None, raw=text)
 
+    m = _RE_MARK_DONE_BY_NUM.match(raw)
+    if m:
+        number = parse_quest_number(m.group("num"))
+        if number:
+            return ParsedAction(kind="complete", quest_number=number, raw=text)
+
     m = _RE_MARK_DONE.match(raw)
     if m:
         title = (m.group("title") or "").strip(" :.-")
-        return ParsedAction(kind="complete", title=title or None, raw=text)
+        if parse_quest_number(title) is None:
+            return ParsedAction(kind="complete", title=title or None, raw=text)
+
+    m = _RE_COMPLETE_BY_NUM.match(raw)
+    if m:
+        number = parse_quest_number(m.group("num"))
+        if number:
+            return ParsedAction(kind="complete", quest_number=number, raw=text)
 
     if _RE_DONE_PREFIX.match(raw):
         title = _RE_DONE_PREFIX.sub("", raw, count=1).strip(" :.-")

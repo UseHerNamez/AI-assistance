@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -43,26 +44,81 @@ class LocalLLMInterpreter:
         *,
         model: str = DEFAULT_MODEL,
         endpoint: str = DEFAULT_ENDPOINT,
-        timeout_s: float = 3.5,
-        max_good_latency_s: float = 2.8,
+        timeout_s: float = 5.0,
+        max_good_latency_s: float = 3.5,
     ) -> None:
         self.model = model
         self.endpoint = endpoint.rstrip("/")
         self.timeout_s = timeout_s
         self.max_good_latency_s = max_good_latency_s
-        self.hardware: HardwareProfile = detect_hardware_profile()
-        self.disabled_reason: Optional[str] = None
-        self._disabled_until = 0.0
+        self.hardware: Optional[HardwareProfile] = None
+        # Until hardware is probed (and the model warmed) in the background, keep
+        # the LLM "disabled" so startup is instant and the deterministic parser
+        # handles any early commands without blocking the UI thread.
+        self.disabled_reason: Optional[str] = "starting up"
+        self._disabled_until = float("inf")
         self._slow_count = 0
-        if not self.hardware.allow_llm:
-            self.disabled_reason = self.hardware.reason
+        self._fail_count = 0
+        self._hw_ready = False
+        self._warmed = False
+        threading.Thread(target=self._startup_probe, daemon=True).start()
+
+    def _startup_probe(self) -> None:
+        try:
+            hw = detect_hardware_profile()
+        except Exception:
+            hw = None
+        self.hardware = hw
+
+        if hw is None:
+            self.disabled_reason = "hardware detection failed"
             self._disabled_until = float("inf")
+            self._hw_ready = True
+            return
+        if not hw.allow_llm:
+            self.disabled_reason = hw.reason
+            self._disabled_until = float("inf")
+            self._hw_ready = True
+            return
+
+        self.disabled_reason = None
+        self._disabled_until = 0.0
+        self._hw_ready = True
+        self._warmup()
+
+    def _warmup(self) -> None:
+        # Load the model into memory so the first real command is fast instead of
+        # paying the multi-second cold-start latency mid-conversation.
+        if self._warmed:
+            return
+        try:
+            payload = {
+                "model": self.model,
+                "stream": False,
+                "keep_alive": "30m",
+                "messages": [{"role": "user", "content": "ok"}],
+                "options": {"num_predict": 1, "temperature": 0.0},
+            }
+            req = urllib.request.Request(
+                f"{self.endpoint}/api/chat",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as response:
+                response.read()
+            self._warmed = True
+        except Exception:
+            self._warmed = False
 
     @property
     def is_enabled(self) -> bool:
-        if self.disabled_reason and time.monotonic() >= self._disabled_until:
+        if not self._hw_ready:
+            return False
+        if self.disabled_reason and self._disabled_until != float("inf") and time.monotonic() >= self._disabled_until:
             self.disabled_reason = None
             self._slow_count = 0
+            self._fail_count = 0
         return self.disabled_reason is None
 
     def interpret(
@@ -71,30 +127,51 @@ class LocalLLMInterpreter:
         *,
         pending_add: bool = False,
         jarvis_awake: bool = False,
+        open_quests: Optional[list[dict[str, object]]] = None,
+        source: str = "voice",
     ) -> Optional[LLMResult]:
         if not self.is_enabled:
             return None
 
+        # Calls run off the UI thread, so we can afford a generous timeout that
+        # tolerates an occasional slow inference without freezing anything.
+        timeout_s = 12.0 if source == "voice" else 8.0
+        max_good = self.max_good_latency_s
+
         started = time.perf_counter()
         try:
-            payload = self._build_payload(text, pending_add=pending_add, jarvis_awake=jarvis_awake)
+            payload = self._build_payload(
+                text,
+                pending_add=pending_add,
+                jarvis_awake=jarvis_awake,
+                open_quests=open_quests or [],
+            )
             req = urllib.request.Request(
                 f"{self.endpoint}/api/chat",
                 data=json.dumps(payload).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as response:
+            with urllib.request.urlopen(req, timeout=timeout_s) as response:
                 raw = response.read().decode("utf-8", errors="replace")
-        except (TimeoutError, urllib.error.URLError, OSError):
-            self._disable_temporarily("local LLM unavailable", cooldown_s=60.0)
+        except urllib.error.URLError as exc:
+            reason = str(getattr(exc, "reason", exc)).lower()
+            if "refused" in reason or "could not" in reason or "no connection" in reason:
+                # Ollama is not running at all; back off briefly, do not spam it.
+                self._disable_temporarily("local model not running", cooldown_s=30.0)
+            else:
+                self._note_failure()
+            return None
+        except (TimeoutError, OSError):
+            self._note_failure()
             return None
 
+        self._fail_count = 0
         elapsed = time.perf_counter() - started
-        if elapsed > self.max_good_latency_s:
+        if elapsed > max_good:
             self._slow_count += 1
-            if self._slow_count >= 2:
-                self._disable_temporarily(f"local LLM too slow ({elapsed:.1f}s)", cooldown_s=300.0)
+            if self._slow_count >= 4:
+                self._disable_temporarily(f"local LLM too slow ({elapsed:.1f}s)", cooldown_s=120.0)
         else:
             self._slow_count = 0
 
@@ -122,46 +199,51 @@ class LocalLLMInterpreter:
         self.disabled_reason = reason
         self._disabled_until = time.monotonic() + cooldown_s
 
-    def _build_payload(self, text: str, *, pending_add: bool, jarvis_awake: bool) -> dict[str, Any]:
-        awake_hint = (
-            "Jarvis is awake and visible. The user may talk without saying 'Jarvis'. "
-            "Use reply for casual conversation, greetings, comments, and general questions. "
-            "Do not use noop for normal chit-chat while awake. "
-            if jarvis_awake
-            else "Jarvis is hidden/asleep. Only act on clear commands. Casual statements are noop unless they are clear commands. "
-        )
+    def _note_failure(self) -> None:
+        # Tolerate the occasional slow/cold response; only back off after a few
+        # consecutive failures so one timeout does not knock the LLM offline.
+        self._fail_count += 1
+        if self._fail_count >= 2:
+            self._fail_count = 0
+            self._disable_temporarily("local LLM unresponsive", cooldown_s=30.0)
+
+    def _build_payload(
+        self,
+        text: str,
+        *,
+        pending_add: bool,
+        jarvis_awake: bool,
+        open_quests: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        # Keep this prompt SHORT. On modest hardware, prompt length dominates
+        # latency, so a compact instruction keeps responses near ~1.5-3s.
+        mood = "Reply to small talk." if jarvis_awake else "Ignore idle chatter."
         system = (
-            "You are Jarvis, a local desktop quest assistant. Convert the user's natural "
-            "English command into JSON only. Do not explain. "
-            f"{awake_hint}"
-            "Allowed action kinds: show, hide, listen_off, add_done, quit, add, complete, delete, "
-            "set_fx, open_browser, web_search, reply, noop. "
-            "Use add for quests/missions/tasks to create. Use complete for marking done. "
-            "Use delete for removal. Use show/hide for opening or hiding the widget. "
-            "Use set_fx with value 'on' or 'off' for visual/FX/animation requests. "
-            "Use open_browser to open the default browser. Use web_search with value as the search query. "
-            "Use reply for casual conversation, opinions, greetings, or when no safe computer action applies. "
-            "Use listen_off for privacy mode, mute, turn off the mic/microphone, or stopping listening. "
-            "Important: 'wake up', 'open up', 'show yourself', and 'appear' mean show, never listen_off. "
-            "'stop listening', 'mute', 'privacy mode', 'turn off the mic', and 'mic off' mean listen_off. "
-            "If the user says they want to add a quest but gives no title, output add with title null. "
-            "Only output add when the user clearly asks to add, create, record, log, or write down a quest, "
-            "mission, or task, or when pending_add is true. "
-            "If pending_add is true, treat the user's words as quest titles unless they clearly stop adding "
-            "or ask a question. Questions like 'why did you add that' or 'what did you do' must be noop. "
-            "Never create quests from open/show/hide/delete/why/what/how questions. "
-            "For reply actions, keep value short: one or two friendly sentences. "
-            "Split multiple quests into multiple add actions. Keep titles short and imperative, e.g. "
-            "'wash dishes', 'clean the house', 'work out', 'study math'. "
-            "Return exactly this JSON shape: {\"actions\":[{\"kind\":\"reply\",\"value\":\"Of course, sir.\"}]}."
+            "You are Jarvis. Output JSON only, no prose. " + mood + " "
+            "Map casual speech to one action. Kinds: "
+            "set_fx(value on|off) for glow/effects/animations/visuals; "
+            "show; hide for close/go away/disappear/minimize (never quit); "
+            "listen_off for mute/privacy/stop listening; "
+            "quit for shut down/exit/quit; "
+            "add(title) to create a quest/task; "
+            "complete(title) to finish one (use the number for 'task 2'); "
+            "delete(title) to remove; reply(value) for chat; noop if unclear. "
+            "open_quests lists current tasks by number. "
+            'Return {"actions":[{"kind":"...","title":null,"value":null}]}.'
         )
-        user = json.dumps({"pending_add": pending_add, "jarvis_awake": jarvis_awake, "utterance": text})
+        user = json.dumps(
+            {
+                "pending_add": pending_add,
+                "open_quests": open_quests,
+                "utterance": text,
+            }
+        )
         return {
             "model": self.model,
             "stream": False,
             "format": "json",
             "keep_alive": "30m",
-            "options": {"temperature": 0.0, "num_predict": 220},
+            "options": {"temperature": 0.0, "num_predict": 96},
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},

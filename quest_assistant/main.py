@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import traceback
+from pathlib import Path
 
 from PySide6 import QtCore, QtWidgets
 
@@ -9,7 +11,40 @@ from quest_assistant.single_instance import acquire_single_instance_lock
 from quest_assistant.ui_widget import QuestWidget
 
 
+def _install_crash_logger() -> None:
+    log_path = Path.home() / ".quest_assistant" / "crash.log"
+
+    def _write(kind: str, exc: BaseException) -> None:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"\n--- {kind} ---\n")
+                traceback.print_exception(type(exc), exc, exc.__traceback__, file=handle)
+        except Exception:
+            pass
+
+    def _excepthook(exc_type, exc, tb) -> None:  # noqa: ANN001
+        if exc is not None:
+            _write("main", exc)
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _excepthook
+
+    if hasattr(QtCore, "qInstallMessageHandler"):
+        def _qt_message_handler(mode, context, message) -> None:  # noqa: ANN001
+            if mode in {QtCore.QtMsgType.QtFatalMsg, QtCore.QtMsgType.QtCriticalMsg}:
+                try:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with log_path.open("a", encoding="utf-8") as handle:
+                        handle.write(f"\n--- qt-{mode.name} ---\n{message}\n")
+                except Exception:
+                    pass
+
+        QtCore.qInstallMessageHandler(_qt_message_handler)
+
+
 def main() -> int:
+    _install_crash_logger()
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 

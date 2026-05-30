@@ -127,6 +127,8 @@ class VoiceListener:
         self._gate = WakeWordGate(wake_word=wake_word, command_window_s=command_window_s)
         self._require_wake_word = True
         self._gate_lock = threading.Lock()
+        self._rec: Optional[KaldiRecognizer] = None
+        self._results_muted = False
 
     def set_wake_word_required(self, required: bool) -> None:
         with self._gate_lock:
@@ -134,21 +136,47 @@ class VoiceListener:
             if required:
                 self._gate.disarm()
 
+    def set_results_muted(self, muted: bool) -> None:
+        with self._gate_lock:
+            self._results_muted = muted
+        if not muted:
+            rec = self._rec
+            if rec is not None:
+                try:
+                    rec.Reset()
+                except Exception:
+                    pass
+
     @property
     def is_running(self) -> bool:
         return self._running.is_set()
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            if not self._stop.is_set():
+                return
+            thread.join(timeout=3.0)
+            if thread.is_alive():
+                return
+        self._thread = None
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3.0)
+        self._thread = None
+        self._running.clear()
+        self._rec = None
+
+    def restart(self) -> None:
+        self.stop()
+        self._stop.clear()
+        self.start()
 
     def _run(self) -> None:
         model_path = resolve_vosk_model_path()
@@ -159,6 +187,7 @@ class VoiceListener:
         model = Model(str(model_path))
         rec = KaldiRecognizer(model, self.config.sample_rate)
         rec.SetWords(False)
+        self._rec = rec
 
         q: "queue.Queue[np.ndarray]" = queue.Queue()
 
@@ -167,21 +196,21 @@ class VoiceListener:
                 return
             q.put(indata.copy().reshape(-1))
 
+        try:
+            stream = sd.InputStream(
+                samplerate=self.config.sample_rate,
+                channels=1,
+                dtype="int16",
+                callback=callback,
+                device=self.config.device,
+                blocksize=8000,
+            )
+        except Exception:
+            self._rec = None
+            return
+
         self._running.set()
         try:
-            try:
-                stream = sd.InputStream(
-                    samplerate=self.config.sample_rate,
-                    channels=1,
-                    dtype="int16",
-                    callback=callback,
-                    device=self.config.device,
-                    blocksize=8000,
-                )
-            except Exception:
-                # If audio init fails (no mic permission/device), fail silently.
-                return
-
             with stream:
                 while not self._stop.is_set():
                     try:
@@ -198,7 +227,11 @@ class VoiceListener:
                             require_wake = self._require_wake_word
                         cmd = self._gate.feed(text, require_wake_word=require_wake)
                         if cmd:
+                            with self._gate_lock:
+                                if self._results_muted:
+                                    continue
                             self.on_text(cmd)
         finally:
+            self._rec = None
             self._running.clear()
 
