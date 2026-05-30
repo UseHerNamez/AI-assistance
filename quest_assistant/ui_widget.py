@@ -241,14 +241,15 @@ class AIFXBackground(QtWidgets.QFrame):
         self.phase = 0.0
         self._rng = random.Random()
         self._signals: list[dict] = []
-        self._update_pending = False
+        self._paint_failures = 0
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
 
     def set_visuals(self, enabled: bool) -> None:
         self.enabled = enabled
         if not enabled:
             self._signals.clear()
-            self._update_pending = False
+            self._paint_failures = 0
         self._request_update()
 
     def set_phase(self, phase: float) -> None:
@@ -263,15 +264,7 @@ class AIFXBackground(QtWidgets.QFrame):
             return
         if self.width() <= 0 or self.height() <= 0:
             return
-        if self._update_pending:
-            return
-        self._update_pending = True
-        QtCore.QTimer.singleShot(0, self._flush_update)
-
-    def _flush_update(self) -> None:
-        self._update_pending = False
-        if self.enabled and self.isVisible():
-            self.update()
+        self.update()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
         super().paintEvent(event)
@@ -285,6 +278,7 @@ class AIFXBackground(QtWidgets.QFrame):
             with QtGui.QPainter(self) as painter:
                 if not painter.isActive():
                     return
+                painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
 
                 glow = QtGui.QRadialGradient(QtCore.QPointF(width * 0.18, height * 0.12), width * 0.75)
                 glow.setColorAt(0.0, QtGui.QColor(34, 211, 238, 36))
@@ -294,7 +288,12 @@ class AIFXBackground(QtWidgets.QFrame):
 
                 for signal in self._signals:
                     self._draw_signal(painter, signal, width, height)
+            self._paint_failures = 0
         except Exception:
+            self._paint_failures += 1
+            if self._paint_failures >= 3:
+                self.enabled = False
+                self._signals.clear()
             return
 
     def _advance_signals(self) -> None:
@@ -302,7 +301,7 @@ class AIFXBackground(QtWidgets.QFrame):
         for signal in self._signals:
             signal["progress"] += signal["speed"]
 
-        if len(self._signals) < 6 and self._rng.random() < 0.28:
+        if len(self._signals) < 7 and self._rng.random() < 0.18:
             self._signals.append(self._new_signal())
 
     def _new_signal(self) -> dict:
@@ -337,7 +336,7 @@ class AIFXBackground(QtWidgets.QFrame):
 
         return {
             "points": points,
-            "speed": self._rng.uniform(0.032, 0.065),
+            "speed": self._rng.uniform(0.012, 0.024),
             "progress": -self._rng.uniform(0.04, 0.14),
             "length": self._rng.uniform(0.030, 0.060),
             "color": self._rng.choice(
@@ -370,10 +369,22 @@ class AIFXBackground(QtWidgets.QFrame):
         if end <= start:
             return
 
-        pen = QtGui.QPen(QtGui.QColor(color.red(), color.green(), color.blue(), 175), 2)
-        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
+        halo = QtGui.QPen(QtGui.QColor(color.red(), color.green(), color.blue(), 52), 9)
+        halo.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        halo.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(halo)
+        self._draw_path_slice(painter, points, total, start, end)
+
+        mid = QtGui.QPen(QtGui.QColor(color.red(), color.green(), color.blue(), 118), 5)
+        mid.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        mid.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(mid)
+        self._draw_path_slice(painter, points, total, start, end)
+
+        core = QtGui.QPen(QtGui.QColor(color.red(), color.green(), color.blue(), 245), 2)
+        core.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        core.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(core)
         self._draw_path_slice(painter, points, total, start, end)
 
     def _draw_path_slice(
@@ -493,6 +504,13 @@ class QuestWidget(QtWidgets.QWidget):
         self._refresh_pending = False
         self._refresh_dirty = False
         self._voice_restart_at = 0.0
+        self._voice_start_pending = False
+        self._jarvis_speaking = False
+        self._voice_command_busy = False
+        self._queued_voice_text = ""
+        self._fx_llm_pause_depth = 0
+        self._pending_llm_request: Optional[tuple[str, str]] = None
+        self._llm_active_seq = 0
         self._llm_result_ready.connect(self._on_llm_result)
 
         self.setWindowTitle("Assistance")
@@ -536,7 +554,8 @@ class QuestWidget(QtWidgets.QWidget):
 
         self._visual_timer = QtCore.QTimer(self)
         self._visual_timer.timeout.connect(self._animate_visuals)
-        self._visual_timer.setInterval(250)
+        self._visual_timer.setInterval(42)
+        self._visual_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
 
         # Always listening in the background (wake word only while hidden).
         self.enable_listening(announce=False)
@@ -647,12 +666,16 @@ class QuestWidget(QtWidgets.QWidget):
     def _tick(self) -> None:
         self._expire_pending_add_if_needed()
         running = self.voice.is_running
+        starting = self.voice.is_starting
         if self.state.listening_requested and not running:
             self.listen_btn.setText("Listening: STARTING…")
-            now = time.monotonic()
-            if now - self._voice_restart_at > 3.0:
-                self._voice_restart_at = now
-                self.voice.restart()
+            # Do not restart while the listener thread is still loading the model
+            # or opening the microphone — that race was freezing/crashing the UI.
+            if not starting and not self._voice_start_pending:
+                now = time.monotonic()
+                if now - self._voice_restart_at > 8.0:
+                    self._voice_restart_at = now
+                    self._begin_voice_listener()
         elif self.state.listening_requested:
             self.listen_btn.setText("Listening: ON")
             self.listen_btn.setChecked(True)
@@ -660,6 +683,29 @@ class QuestWidget(QtWidgets.QWidget):
             self.listen_btn.setText("Listening: OFF")
             self.listen_btn.setChecked(False)
         self._sync_privacy_button()
+
+    def _pause_fx_render(self) -> None:
+        self._visual_timer.stop()
+        self.fx_background.set_visuals(False)
+
+    def _resume_fx_render(self) -> None:
+        if not self.state.visuals_enabled or not self.isVisible():
+            return
+        self.fx_background.set_visuals(True)
+        if not self._visual_timer.isActive():
+            self._visual_timer.start()
+
+    def _pause_fx_for_llm(self) -> None:
+        self._fx_llm_pause_depth += 1
+        if self._fx_llm_pause_depth == 1:
+            self._pause_fx_render()
+
+    def _resume_fx_for_llm(self) -> None:
+        if self._fx_llm_pause_depth <= 0:
+            return
+        self._fx_llm_pause_depth -= 1
+        if self._fx_llm_pause_depth == 0:
+            self._resume_fx_render()
 
     def _toggle_visuals(self) -> None:
         self._set_visuals_enabled(self.visuals_btn.isChecked())
@@ -699,9 +745,18 @@ class QuestWidget(QtWidgets.QWidget):
     def _animate_visuals(self) -> None:
         if not self.state.visuals_enabled or not self.isVisible():
             return
+        if self._jarvis_speaking:
+            return
         try:
-            self._visual_phase = (self._visual_phase + 0.16) % (math.pi * 2)
+            self._visual_phase = (self._visual_phase + 0.038) % (math.pi * 2)
             self.fx_background.set_phase(self._visual_phase)
+            if self.fx_background.enabled != self.state.visuals_enabled:
+                self.state.visuals_enabled = False
+                self._visual_timer.stop()
+                self.visuals_btn.blockSignals(True)
+                self.visuals_btn.setChecked(False)
+                self.visuals_btn.blockSignals(False)
+                self.visuals_btn.setText("AI FX: OFF")
         except Exception:
             self._visual_timer.stop()
             self.state.visuals_enabled = False
@@ -953,11 +1008,17 @@ class QuestWidget(QtWidgets.QWidget):
 
     def _dispatch_llm(self, text: str, source: str, seq: int) -> bool:
         if self._llm_busy:
+            if source == "voice":
+                self._pending_llm_request = (text, source)
             return False
         self._llm_busy = True
+        self._llm_active_seq = seq
+        if source == "voice":
+            self._pause_fx_for_llm()
         pending_add = self._pending_voice_add
         jarvis_awake = self.state.jarvis_awake
         open_quests = self._open_quests_for_llm()
+        dispatch_seq = seq
 
         def worker() -> None:
             result = None
@@ -973,31 +1034,41 @@ class QuestWidget(QtWidgets.QWidget):
                 result = None
             finally:
                 try:
-                    self._llm_result_ready.emit(seq, text, source, result)
+                    self._llm_result_ready.emit(dispatch_seq, text, source, result)
                 except Exception:
                     pass
 
         threading.Thread(target=worker, daemon=True).start()
         return True
 
+    def _finish_llm_turn(self) -> None:
+        self._llm_busy = False
+        self._resume_fx_for_llm()
+        pending = self._pending_llm_request
+        self._pending_llm_request = None
+        if pending:
+            pending_text, pending_source = pending
+            if self.brain.is_enabled and self._should_dispatch_llm(pending_text):
+                self._dispatch_llm(pending_text, pending_source, self._llm_seq)
+
     @QtCore.Slot(int, str, str, object)
     def _on_llm_result(self, seq: int, text: str, source: str, result: object) -> None:
-        self._llm_busy = False
         try:
-            if seq != self._llm_seq:
-                return
-            self._spoke_this_turn = False
-            self._last_command_text = text
-            if result is not None and self._apply_llm_result(text, source, result):
+            if seq == self._llm_seq:
+                self._spoke_this_turn = False
+                self._last_command_text = text
+                if result is not None and self._apply_llm_result(text, source, result):
+                    self.refresh()
+                    return
+                if self._apply_parser_actions(text, source):
+                    self.refresh()
+                    return
                 self.refresh()
-                return
-            # Model returned nothing usable -> last-resort deterministic pass.
-            if self._apply_parser_actions(text, source):
-                self.refresh()
-                return
-            self.refresh()
         except Exception:
             pass
+        finally:
+            if seq == self._llm_active_seq:
+                self._finish_llm_turn()
 
     def _finish_quest_mutation(self) -> None:
         self._set_pending_add(False)
@@ -1261,6 +1332,7 @@ class QuestWidget(QtWidgets.QWidget):
 
         if action.kind == "hide":
             self._jarvis_say("Going quiet, sir.")
+            self._pause_fx_render()
             if not self.isVisible() or self._hide_pending:
                 return True
             if not self._should_accept_control_action("hide"):
@@ -1332,6 +1404,7 @@ class QuestWidget(QtWidgets.QWidget):
         try:
             self._hide_pending = False
             self.state.jarvis_awake = False
+            self._pause_fx_render()
             self.sfx.play("hide")
             self.hide()
             self._sync_voice_gate()
@@ -1435,12 +1508,34 @@ class QuestWidget(QtWidgets.QWidget):
     def enable_listening(self, *, announce: bool = True) -> None:
         self.state.listening_requested = True
         self._voice_restart_at = time.monotonic()
-        self.voice.restart()
-        if announce:
-            self.sfx.play("unmute")
-            self._jarvis_say("Listening, sir.")
+        self._voice_start_pending = announce
         self._sync_voice_gate()
         self._sync_privacy_button()
+        if announce:
+            self.sfx.play("unmute")
+            # Open the mic only after TTS finishes so audio output and input
+            # do not fight on Windows (that combination was crashing the widget).
+            self._jarvis_say("Listening, sir.", on_done=self._schedule_voice_listener_start)
+        else:
+            self._begin_voice_listener()
+
+    def _schedule_voice_listener_start(self) -> None:
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_begin_voice_listener",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
+
+    @QtCore.Slot()
+    def _begin_voice_listener(self) -> None:
+        if not self.state.listening_requested:
+            return
+        self._voice_start_pending = False
+        try:
+            self._voice_restart_at = time.monotonic()
+            self.voice.restart()
+        except Exception:
+            pass
 
     def disable_listening(self) -> None:
         self.state.listening_requested = False
@@ -1483,9 +1578,33 @@ class QuestWidget(QtWidgets.QWidget):
                 return
             if self._is_duplicate_voice_text(text):
                 return
+            self._queue_voice_command(text)
+        except Exception:
+            pass
+
+    def _queue_voice_command(self, text: str) -> None:
+        self._queued_voice_text = text
+        if self._voice_command_busy:
+            return
+        self._voice_command_busy = True
+        QtCore.QTimer.singleShot(0, self._process_queued_voice_command)
+
+    @QtCore.Slot()
+    def _process_queued_voice_command(self) -> None:
+        text = self._queued_voice_text
+        self._queued_voice_text = ""
+        if not text:
+            self._voice_command_busy = False
+            return
+        try:
             self._apply_text(text, source="voice")
         except Exception:
             pass
+        finally:
+            if self._queued_voice_text:
+                QtCore.QTimer.singleShot(0, self._process_queued_voice_command)
+            else:
+                self._voice_command_busy = False
 
     @classmethod
     def _is_meaningful_voice_text(cls, text: str) -> bool:
@@ -1513,6 +1632,7 @@ class QuestWidget(QtWidgets.QWidget):
 
     @QtCore.Slot(bool)
     def _on_speaker_state_ui(self, speaking: bool) -> None:
+        self._jarvis_speaking = speaking
         self.voice.set_results_muted(speaking)
         if not speaking:
             self._voice_grace_until = time.monotonic() + self._VOICE_GRACE_AFTER_SPEECH_S
@@ -1619,8 +1739,14 @@ class QuestWidget(QtWidgets.QWidget):
         self.raise_()
         self.activateWindow()
         self._hide_from_taskbar(self)
-        if self.state.listening_requested and not self.voice.is_running:
-            self.voice.restart()
+        if (
+            self.state.listening_requested
+            and not self.voice.is_running
+            and not self.voice.is_starting
+            and not self._voice_start_pending
+        ):
+            self._begin_voice_listener()
+        self._resume_fx_render()
         self._sync_voice_gate()
         self._sync_privacy_button()
 
@@ -1628,13 +1754,20 @@ class QuestWidget(QtWidgets.QWidget):
         self.state.jarvis_awake = True
         super().showEvent(event)
         self._hide_from_taskbar(self)
-        if self.state.listening_requested and not self.voice.is_running:
-            self.voice.restart()
+        if (
+            self.state.listening_requested
+            and not self.voice.is_running
+            and not self.voice.is_starting
+            and not self._voice_start_pending
+        ):
+            self._begin_voice_listener()
+        self._resume_fx_render()
         self._sync_voice_gate()
         self._sync_privacy_button()
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:  # noqa: N802
         self.state.jarvis_awake = False
+        self._pause_fx_render()
         super().hideEvent(event)
         self._sync_voice_gate()
         self._sync_privacy_button()

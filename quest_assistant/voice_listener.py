@@ -16,6 +16,17 @@ from vosk import KaldiRecognizer, Model
 
 DEFAULT_MODEL_DIR = Path.home() / ".quest_assistant" / "models" / "vosk-model-small-en-us-0.15"
 
+_MODEL_CACHE: Optional[Model] = None
+_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _get_vosk_model(model_path: Path) -> Model:
+    global _MODEL_CACHE
+    with _MODEL_CACHE_LOCK:
+        if _MODEL_CACHE is None:
+            _MODEL_CACHE = Model(str(model_path))
+        return _MODEL_CACHE
+
 
 def resolve_vosk_model_path() -> Optional[Path]:
     env = os.environ.get("VOSK_MODEL_PATH")
@@ -151,6 +162,11 @@ class VoiceListener:
     def is_running(self) -> bool:
         return self._running.is_set()
 
+    @property
+    def is_starting(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive() and not self._running.is_set()
+
     def start(self) -> None:
         thread = self._thread
         if thread is not None and thread.is_alive():
@@ -174,6 +190,8 @@ class VoiceListener:
         self._rec = None
 
     def restart(self) -> None:
+        if self.is_starting:
+            return
         self.stop()
         self._stop.clear()
         self.start()
@@ -181,10 +199,12 @@ class VoiceListener:
     def _run(self) -> None:
         model_path = resolve_vosk_model_path()
         if not model_path:
-            # No model configured; do nothing.
             return
 
-        model = Model(str(model_path))
+        try:
+            model = _get_vosk_model(model_path)
+        except Exception:
+            return
         rec = KaldiRecognizer(model, self.config.sample_rate)
         rec.SetWords(False)
         self._rec = rec
@@ -218,19 +238,22 @@ class VoiceListener:
                     except queue.Empty:
                         continue
 
-                    if rec.AcceptWaveform(data.tobytes()):
-                        result = json.loads(rec.Result() or "{}")
-                        text = (result.get("text") or "").strip()
-                        if not text:
-                            continue
-                        with self._gate_lock:
-                            require_wake = self._require_wake_word
-                        cmd = self._gate.feed(text, require_wake_word=require_wake)
-                        if cmd:
+                    try:
+                        if rec.AcceptWaveform(data.tobytes()):
+                            result = json.loads(rec.Result() or "{}")
+                            text = (result.get("text") or "").strip()
+                            if not text:
+                                continue
                             with self._gate_lock:
-                                if self._results_muted:
-                                    continue
-                            self.on_text(cmd)
+                                require_wake = self._require_wake_word
+                            cmd = self._gate.feed(text, require_wake_word=require_wake)
+                            if cmd:
+                                with self._gate_lock:
+                                    if self._results_muted:
+                                        continue
+                                self.on_text(cmd)
+                    except Exception:
+                        continue
         finally:
             self._rec = None
             self._running.clear()
