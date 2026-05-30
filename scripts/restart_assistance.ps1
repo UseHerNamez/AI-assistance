@@ -47,8 +47,7 @@ if (Test-Path $pythonw) {
     }
 }
 
-$env:JARVIS_TTS_BACKEND = "edge"
-$env:JARVIS_EDGE_VOICE = "en-GB-RyanNeural"
+$env:JARVIS_TTS_BACKEND = "sapi"
 
 Start-Process -FilePath $exe -ArgumentList "-m", "quest_assistant" -WorkingDirectory $projectDir -WindowStyle Hidden
-Write-Host "Assistance restarted from $projectDir using $exe (edge voice)"
+Write-Host "Assistance restarted from $projectDir using $exe (local voice)"

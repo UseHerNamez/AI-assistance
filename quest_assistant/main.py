@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -44,6 +45,8 @@ def _install_crash_logger() -> None:
 
 
 def main() -> int:
+    # Force local voice unless the user explicitly opted into Edge TTS.
+    os.environ.setdefault("JARVIS_TTS_BACKEND", "sapi")
     _install_crash_logger()
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -96,7 +99,7 @@ def main() -> int:
         except Exception:
             pass
         try:
-            w.speaker.stop()
+            w.speaker.shutdown()
         except Exception:
             pass
         try:

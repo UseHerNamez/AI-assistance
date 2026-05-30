@@ -10,7 +10,7 @@ A small Windows desktop widget that lets you manage daily "quests" (tasks) by ty
 - Optional free local LLM understanding through Ollama, with parser fallback if it is unavailable or too slow
 - Hardware-aware LLM mode: strong CPUs or dedicated GPUs use the LLM; weaker machines fall back to the parser
 - Optional **always-listening** voice capture (local speech-to-text) to add/complete quests
-- Voice feedback so Jarvis confirms commands out loud, preferring a polished male neural voice when online
+- Voice feedback so Jarvis confirms commands out loud using the local Windows voice by default (offline). Set `JARVIS_TTS_BACKEND=edge` for Microsoft neural TTS when online.
 - Optional local sound effects for show/hide/mute/add/complete/delete events (off by default)
 - Optional AI FX UI mode with randomly generated fast signal traces and subtle glow; can be turned off for lower CPU usage
 - Privacy mode: say "Jarvis stop listening" to close the mic stream, then click the red button to listen again
@@ -159,19 +159,19 @@ Jarvis stop listening
 
 When listening is stopped, the app cannot hear "Jarvis" anymore. A red always-on-top button appears so you can click it to resume listening.
 
-Jarvis also speaks short confirmations, for example after opening, hiding, adding a quest, completing a quest, or entering privacy mode. By default, it uses Microsoft Edge neural TTS with `en-GB-RyanNeural` for a polished male assistant style and caches generated phrases for faster repeated playback.
+Jarvis also speaks short confirmations, for example after opening, hiding, adding a quest, completing a quest, or entering privacy mode. By default it uses the **local Windows voice (SAPI)** so quest titles never leave your PC. Set `JARVIS_TTS_BACKEND=edge` for Microsoft Edge neural TTS (`en-GB-RyanNeural` by default).
 
 Voice overrides:
 
 ```powershell
-$env:JARVIS_EDGE_VOICE="en-US-GuyNeural" # different male neural voice
-$env:JARVIS_TTS_BACKEND="edge"           # neural voice, default
-$env:JARVIS_TTS_BACKEND="auto"           # instant short replies, neural longer replies
-$env:JARVIS_TTS_BACKEND="sapi"           # force offline Windows voice, fastest
+$env:JARVIS_TTS_BACKEND="sapi"           # local Windows voice, default
+$env:JARVIS_TTS_BACKEND="edge"           # neural voice (sends text to Microsoft)
+$env:JARVIS_TTS_BACKEND="auto"           # local voice first, neural fallback
+$env:JARVIS_EDGE_VOICE="en-US-GuyNeural" # different male neural voice (edge only)
 $env:JARVIS_SFX="1"                      # enable optional beep sound effects
 ```
 
-When Ollama and the local model are available, Jarvis tries the LLM first for natural language understanding. If the LLM is missing, offline, errors, or responds too slowly for the computer, Jarvis automatically falls back to the built-in parser.
+When Ollama and the local model are available, Jarvis tries the LLM first for natural language understanding. Ollama must run on **this PC** (`127.0.0.1:11434`); remote `OLLAMA_HOST` values are ignored for privacy. If the LLM is missing, offline, errors, or responds too slowly for the computer, Jarvis automatically falls back to the built-in parser.
 
 Jarvis also checks hardware before using the LLM. Dedicated GPUs like NVIDIA GeForce/GTX/RTX/Quadro, AMD Radeon/RX, or Intel Arc prefer the LLM. Strong CPUs such as Core i7/i9 or Ryzen 7/9 can use it too. Weak or unknown machines default to the parser. You can override this with:
 

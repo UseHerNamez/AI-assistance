@@ -15,18 +15,35 @@ from typing import Callable, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from quest_assistant.db import QuestDB, Task
-from quest_assistant.local_llm import LLMAction, LocalLLMInterpreter
+from quest_assistant.diagnostics import log_diagnostic
+from quest_assistant.local_llm import LLMAction, LLMResult, LocalLLMInterpreter
 from quest_assistant.parser import (
     extract_add_titles,
+    extract_delete_quest_number,
     extract_quest_titles,
     has_add_intent,
+    has_complete_intent,
+    has_delete_intent,
+    has_edit_intent,
     has_numbered_quest_markers,
     infer_casual_intent,
+    is_delete_title_placeholder,
+    local_chat_reply,
+    looks_like_chat,
+    looks_like_delete_intent,
+    looks_like_typed_quest,
     normalize_quest_title,
+    normalize_voice_command,
     parse_action,
+    parse_quest_number,
     parse_fx_enabled,
     parse_hide_intent,
+    parse_listen_off_intent,
+    looks_like_listen_off,
+    parse_open_browser_intent,
     parse_quit_intent,
+    parse_web_search_query,
+    resolve_fx_enabled,
     split_into_items,
 )
 from quest_assistant.sound_effects import SoundEffects
@@ -58,8 +75,102 @@ class UIState:
     jarvis_awake: bool = False
 
 
+@dataclass(frozen=True)
+class _QuestListSnapshot:
+    open_rows: list[tuple[int, int, str]]  # task_id, number, title
+    done_rows: list[tuple[int, str]]  # task_id, title
+    use_compact: bool
+
+
+_ROLE_TASK_ID = QtCore.Qt.ItemDataRole.UserRole
+_ROLE_QUEST_NUM = QtCore.Qt.ItemDataRole.UserRole + 1
+
+
+class _OpenQuestListDelegate(QtWidgets.QStyledItemDelegate):
+    """Paint 'N. title' but edit the plain title only — avoids double-text overlap."""
+
+    _EDITOR_STYLE = (
+        "QLineEdit {"
+        "  background: rgb(15, 23, 42);"
+        "  color: #f3f4f6;"
+        "  border: 1px solid rgba(34, 211, 238, 90);"
+        "  border-radius: 4px;"
+        "  padding: 1px 4px;"
+        "  selection-background-color: rgba(34, 211, 238, 120);"
+        "}"
+    )
+
+    def paint(
+        self,
+        painter: QtGui.QPainter,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> None:
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = option.widget
+        if widget is None:
+            return
+
+        if opt.state & QtWidgets.QStyle.StateFlag.State_Editing:
+            # Erase the painted label so only the line editor is visible.
+            opt.text = ""
+        else:
+            number = index.data(_ROLE_QUEST_NUM) or (index.row() + 1)
+            title = index.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
+            opt.text = f"{number}. {title}"
+
+        widget.style().drawControl(
+            QtWidgets.QStyle.ControlElement.CE_ItemViewItem,
+            opt,
+            painter,
+            widget,
+        )
+
+    def createEditor(
+        self,
+        parent: QtWidgets.QWidget,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> QtWidgets.QWidget:
+        editor = QtWidgets.QLineEdit(parent)
+        editor.setFrame(False)
+        editor.setStyleSheet(self._EDITOR_STYLE)
+        return editor
+
+    def updateEditorGeometry(
+        self,
+        editor: QtWidgets.QWidget,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> None:
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = option.widget
+        style = widget.style() if widget else QtWidgets.QApplication.style()
+        text_rect = style.subElementRect(
+            QtWidgets.QStyle.SubElement.SE_ItemViewItemText,
+            opt,
+            widget,
+        )
+        editor.setGeometry(text_rect)
+
+    def setEditorData(self, editor: QtWidgets.QWidget, index: QtCore.QModelIndex) -> None:
+        if isinstance(editor, QtWidgets.QLineEdit):
+            editor.setText(index.data(QtCore.Qt.ItemDataRole.DisplayRole) or "")
+
+    def setModelData(
+        self,
+        editor: QtWidgets.QWidget,
+        model: QtCore.QAbstractItemModel,
+        index: QtCore.QModelIndex,
+    ) -> None:
+        if isinstance(editor, QtWidgets.QLineEdit):
+            model.setData(index, editor.text().strip(), QtCore.Qt.ItemDataRole.EditRole)
+
+
 class PrivacyListenButton(QtWidgets.QWidget):
-    _DIAMETER = 168
+    _DIAMETER = round(168 * 0.88)  # 12% smaller than original 168px circle
 
     def __init__(self, on_enable: Callable[[], None]) -> None:
         super().__init__()
@@ -235,9 +346,21 @@ class PrivacyListenButton(QtWidgets.QWidget):
 
 
 class AIFXBackground(QtWidgets.QFrame):
+    _MAX_SIGNALS = 3
+    _SPAWN_CHANCE = 0.07
+    _PALETTE = (
+        (34, 211, 238),
+        (56, 189, 248),
+        (96, 165, 250),
+        (45, 212, 191),
+        (74, 222, 128),
+        (167, 139, 250),
+    )
+
     def __init__(self) -> None:
         super().__init__()
         self.enabled = False
+        self._motion = False
         self.phase = 0.0
         self._rng = random.Random()
         self._signals: list[dict] = []
@@ -250,14 +373,25 @@ class AIFXBackground(QtWidgets.QFrame):
         if not enabled:
             self._signals.clear()
             self._paint_failures = 0
+            self._motion = False
+        self._request_update()
+
+    def set_motion(self, enabled: bool) -> None:
+        self._motion = enabled
+        if not enabled:
+            self._signals.clear()
         self._request_update()
 
     def set_phase(self, phase: float) -> None:
         self.phase = phase
         if not self.enabled:
             return
-        self._advance_signals()
-        self._request_update()
+        try:
+            if self._motion:
+                self._advance_signals()
+            self._request_update()
+        except Exception:
+            self._signals.clear()
 
     def _request_update(self) -> None:
         if not self.enabled or not self.isVisible():
@@ -275,19 +409,30 @@ class AIFXBackground(QtWidgets.QFrame):
         if width <= 0 or height <= 0:
             return
         try:
-            with QtGui.QPainter(self) as painter:
-                if not painter.isActive():
-                    return
+            painter = QtGui.QPainter(self)
+            if not painter.isActive():
+                return
+
+            pulse = 0.55 + (0.45 * math.sin(self.phase))
+            if not self._motion:
+                pulse = 0.55 + (0.45 * math.sin(time.monotonic() * 1.6))
+
+            glow = QtGui.QRadialGradient(QtCore.QPointF(width * 0.18, height * 0.12), width * 0.78)
+            glow.setColorAt(0.0, QtGui.QColor(34, 211, 238, int(34 + (pulse * 22))))
+            glow.setColorAt(0.42, QtGui.QColor(59, 130, 246, int(14 + (pulse * 12))))
+            glow.setColorAt(1.0, QtGui.QColor(0, 0, 0, 0))
+            painter.fillRect(self.rect(), QtGui.QBrush(glow))
+
+            corner = QtGui.QRadialGradient(QtCore.QPointF(width * 0.88, height * 0.08), width * 0.42)
+            corner.setColorAt(0.0, QtGui.QColor(167, 139, 250, int(10 + (pulse * 14))))
+            corner.setColorAt(1.0, QtGui.QColor(0, 0, 0, 0))
+            painter.fillRect(self.rect(), QtGui.QBrush(corner))
+
+            if self._motion:
                 painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-
-                glow = QtGui.QRadialGradient(QtCore.QPointF(width * 0.18, height * 0.12), width * 0.75)
-                glow.setColorAt(0.0, QtGui.QColor(34, 211, 238, 36))
-                glow.setColorAt(0.45, QtGui.QColor(59, 130, 246, 14))
-                glow.setColorAt(1.0, QtGui.QColor(0, 0, 0, 0))
-                painter.fillRect(self.rect(), QtGui.QBrush(glow))
-
                 for signal in self._signals:
                     self._draw_signal(painter, signal, width, height)
+            painter.end()
             self._paint_failures = 0
         except Exception:
             self._paint_failures += 1
@@ -301,7 +446,7 @@ class AIFXBackground(QtWidgets.QFrame):
         for signal in self._signals:
             signal["progress"] += signal["speed"]
 
-        if len(self._signals) < 7 and self._rng.random() < 0.18:
+        if len(self._signals) < self._MAX_SIGNALS and self._rng.random() < self._SPAWN_CHANCE:
             self._signals.append(self._new_signal())
 
     def _new_signal(self) -> dict:
@@ -336,19 +481,10 @@ class AIFXBackground(QtWidgets.QFrame):
 
         return {
             "points": points,
-            "speed": self._rng.uniform(0.012, 0.024),
+            "speed": self._rng.uniform(0.020, 0.038),
             "progress": -self._rng.uniform(0.04, 0.14),
-            "length": self._rng.uniform(0.030, 0.060),
-            "color": self._rng.choice(
-                (
-                    QtGui.QColor(74, 222, 128),
-                    QtGui.QColor(34, 197, 94),
-                    QtGui.QColor(45, 212, 191),
-                    QtGui.QColor(34, 211, 238),
-                    QtGui.QColor(56, 189, 248),
-                    QtGui.QColor(96, 165, 250),
-                )
-            ),
+            "length": self._rng.uniform(0.038, 0.072),
+            "rgb": self._rng.choice(self._PALETTE),
         }
 
     def _draw_signal(self, painter: QtGui.QPainter, signal: dict, width: int, height: int) -> None:
@@ -362,26 +498,25 @@ class AIFXBackground(QtWidgets.QFrame):
 
         head = signal["progress"]
         tail = head - signal["length"]
-        color: QtGui.QColor = signal["color"]
 
         start = max(0.0, tail)
         end = min(1.0, head)
         if end <= start:
             return
 
-        halo = QtGui.QPen(QtGui.QColor(color.red(), color.green(), color.blue(), 52), 9)
-        halo.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-        halo.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(halo)
+        r, g, b = signal["rgb"]
+        flicker = 0.78 + (0.22 * math.sin((head * 18.0) + self.phase))
+
+        aura = QtGui.QPen(QtGui.QColor(r, g, b, int(52 * flicker)), 7)
+        aura.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        aura.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(aura)
         self._draw_path_slice(painter, points, total, start, end)
 
-        mid = QtGui.QPen(QtGui.QColor(color.red(), color.green(), color.blue(), 118), 5)
-        mid.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-        mid.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(mid)
-        self._draw_path_slice(painter, points, total, start, end)
-
-        core = QtGui.QPen(QtGui.QColor(color.red(), color.green(), color.blue(), 245), 2)
+        core = QtGui.QPen(
+            QtGui.QColor(min(255, r + 50), min(255, g + 50), min(255, b + 40), int(230 * flicker)),
+            2,
+        )
         core.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
         core.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
         painter.setPen(core)
@@ -450,11 +585,16 @@ class QuestWidget(QtWidgets.QWidget):
     _VOICE_DEDUP_S = 0.9
     _CONTROL_COOLDOWN_S = 0.8
     _ECHO_GUARD_S = 4.5
+    _VOICE_QUEUE_MAX = 6
+    _LLM_PENDING_MAX = 2
+    _VISUAL_TIMER_MS = 80  # ~12 FPS — smooth but lighter on the UI thread
+    _COMPACT_LIST_THRESHOLD = 12
     _LLM_CONTROL_KINDS = frozenset(
         {"show", "hide", "listen_off", "add_done", "quit", "set_fx", "open_browser", "web_search"}
     )
 
     _VOICE_GRACE_AFTER_SPEECH_S = 1.4
+    _REFRESH_DEBOUNCE_MS = 80
     _VOICE_FILLER_WORDS = frozenset(
         {
             "a",
@@ -479,8 +619,9 @@ class QuestWidget(QtWidgets.QWidget):
         }
     )
 
-    # Delivered from a background worker thread -> queued onto the UI thread.
+    # Delivered from background worker threads -> queued onto the UI thread.
     _llm_result_ready = QtCore.Signal(int, str, str, object)
+    _refresh_data_ready = QtCore.Signal(int, object)
 
     def __init__(self, db: QuestDB) -> None:
         super().__init__()
@@ -488,6 +629,8 @@ class QuestWidget(QtWidgets.QWidget):
         self.state = UIState()
         self._pending_voice_add = False
         self._pending_voice_add_until = 0.0
+        self._pending_voice_delete = False
+        self._pending_voice_delete_until = 0.0
         self._last_voice_text = ""
         self._last_voice_at = 0.0
         self._last_control_kind = ""
@@ -503,15 +646,19 @@ class QuestWidget(QtWidgets.QWidget):
         self._llm_seq = 0
         self._refresh_pending = False
         self._refresh_dirty = False
+        self._refresh_worker_busy = False
+        self._refresh_seq = 0
+        self._refreshing_lists = False
         self._voice_restart_at = 0.0
         self._voice_start_pending = False
         self._jarvis_speaking = False
         self._voice_command_busy = False
-        self._queued_voice_text = ""
+        self._voice_command_queue: list[str] = []
         self._fx_llm_pause_depth = 0
-        self._pending_llm_request: Optional[tuple[str, str]] = None
+        self._pending_llm_requests: list[tuple[str, str]] = []
         self._llm_active_seq = 0
         self._llm_result_ready.connect(self._on_llm_result)
+        self._refresh_data_ready.connect(self._on_refresh_data_ready)
 
         self.setWindowTitle("Assistance")
         self.setWindowFlags(
@@ -540,7 +687,12 @@ class QuestWidget(QtWidgets.QWidget):
                 "Listening, sir.",
             ]
         )
-        self.voice = VoiceListener(on_text=self._on_voice_text, wake_word="jarvis", command_window_s=8.0)
+        self.voice = VoiceListener(
+            on_text=self._on_voice_text,
+            on_error=self._on_voice_error,
+            wake_word="jarvis",
+            command_window_s=18.0,
+        )
         self.privacy_button = PrivacyListenButton(
             on_enable=lambda: self.enable_listening(announce=True),
         )
@@ -554,8 +706,8 @@ class QuestWidget(QtWidgets.QWidget):
 
         self._visual_timer = QtCore.QTimer(self)
         self._visual_timer.timeout.connect(self._animate_visuals)
-        self._visual_timer.setInterval(42)
-        self._visual_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self._visual_timer.setInterval(self._VISUAL_TIMER_MS)
+        self._visual_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
 
         # Always listening in the background (wake word only while hidden).
         self.enable_listening(announce=False)
@@ -611,7 +763,7 @@ class QuestWidget(QtWidgets.QWidget):
         layout.addLayout(add_row)
 
         self.input = QtWidgets.QLineEdit()
-        self.input.setPlaceholderText("Add quests… e.g. “wash dishes, workout at 7pm”")
+        self.input.setPlaceholderText('Add or rename… e.g. "wash dishes" or "rename task 1 to …"')
         self.input.returnPressed.connect(self._handle_input)
         add_row.addWidget(self.input, 1)
 
@@ -633,8 +785,9 @@ class QuestWidget(QtWidgets.QWidget):
 
         self.open_list = QtWidgets.QListWidget()
         self.open_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.open_list.setWordWrap(True)
+        self.open_list.setWordWrap(False)
         self.open_list.setUniformItemSizes(False)
+        self.open_list.setItemDelegate(_OpenQuestListDelegate(self.open_list))
         self.open_list.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.open_list, 1)
 
@@ -667,8 +820,13 @@ class QuestWidget(QtWidgets.QWidget):
         self._expire_pending_add_if_needed()
         running = self.voice.is_running
         starting = self.voice.is_starting
+        voice_error = self.voice.last_error
         if self.state.listening_requested and not running:
-            self.listen_btn.setText("Listening: STARTING…")
+            if voice_error and not starting:
+                self.listen_btn.setText("Listening: ERROR")
+                self.footer.setText(voice_error)
+            else:
+                self.listen_btn.setText("Listening: STARTING…")
             # Do not restart while the listener thread is still loading the model
             # or opening the microphone — that race was freezing/crashing the UI.
             if not starting and not self._voice_start_pending:
@@ -679,24 +837,50 @@ class QuestWidget(QtWidgets.QWidget):
         elif self.state.listening_requested:
             self.listen_btn.setText("Listening: ON")
             self.listen_btn.setChecked(True)
+            if voice_error is None:
+                footer = self.footer.text()
+                if footer.startswith("Speech model") or footer.startswith("Microphone"):
+                    self._set_footer_default()
         else:
             self.listen_btn.setText("Listening: OFF")
             self.listen_btn.setChecked(False)
         self._sync_privacy_button()
 
-    def _pause_fx_render(self) -> None:
-        self._visual_timer.stop()
-        self.fx_background.set_visuals(False)
+    def _fx_should_animate(self) -> bool:
+        return (
+            self.state.visuals_enabled
+            and self.isVisible()
+            and not self._jarvis_speaking
+            and not self._llm_busy
+            and not self._voice_command_busy
+            and not self._refresh_worker_busy
+            and self._fx_llm_pause_depth == 0
+        )
 
-    def _resume_fx_render(self) -> None:
+    def _sync_fx_timer(self) -> None:
         if not self.state.visuals_enabled or not self.isVisible():
+            self._visual_timer.stop()
+            self.fx_background.set_visuals(False)
             return
         self.fx_background.set_visuals(True)
-        if not self._visual_timer.isActive():
-            self._visual_timer.start()
+        motion = self._fx_should_animate()
+        self.fx_background.set_motion(motion)
+        if motion:
+            if not self._visual_timer.isActive():
+                self._visual_timer.start()
+            return
+        self._visual_timer.stop()
+        # Static ambient glow still breathes while FX is on but motion is paused.
+        self.fx_background.update()
+
+    def _pause_fx_render(self) -> None:
+        self._visual_timer.stop()
+
+    def _resume_fx_render(self) -> None:
+        self._sync_fx_timer()
 
     def _pause_fx_for_llm(self) -> None:
-        self._fx_llm_pause_depth += 1
+        self._fx_llm_pause_depth = min(self._fx_llm_pause_depth + 1, 8)
         if self._fx_llm_pause_depth == 1:
             self._pause_fx_render()
 
@@ -705,7 +889,14 @@ class QuestWidget(QtWidgets.QWidget):
             return
         self._fx_llm_pause_depth -= 1
         if self._fx_llm_pause_depth == 0:
-            self._resume_fx_render()
+            self._sync_fx_timer()
+
+    def _fx_is_visually_on(self) -> bool:
+        return bool(
+            self.state.visuals_enabled
+            and self.fx_background.enabled
+            and self.visuals_btn.isChecked()
+        )
 
     def _toggle_visuals(self) -> None:
         self._set_visuals_enabled(self.visuals_btn.isChecked())
@@ -730,36 +921,32 @@ class QuestWidget(QtWidgets.QWidget):
             if enabled:
                 self._last_core_alpha = -1
                 self._apply_visual_core_style(1.0)
-                if not self._visual_timer.isActive():
-                    self._visual_timer.start()
             else:
                 self._visual_timer.stop()
                 self._visual_phase = 0.0
                 self.fx_background.set_phase(0.0)
                 self._last_core_alpha = -1
                 self._apply_visual_core_style(0.0)
+            self._sync_fx_timer()
         except Exception:
             self._visual_timer.stop()
             self.state.visuals_enabled = False
 
     def _animate_visuals(self) -> None:
-        if not self.state.visuals_enabled or not self.isVisible():
-            return
-        if self._jarvis_speaking:
+        if not self._fx_should_animate():
+            self._visual_timer.stop()
             return
         try:
-            self._visual_phase = (self._visual_phase + 0.038) % (math.pi * 2)
+            self._visual_phase = (self._visual_phase + 0.085) % (math.pi * 2)
             self.fx_background.set_phase(self._visual_phase)
-            if self.fx_background.enabled != self.state.visuals_enabled:
+        except Exception:
+            self._visual_timer.stop()
+            if self.fx_background.enabled:
                 self.state.visuals_enabled = False
-                self._visual_timer.stop()
                 self.visuals_btn.blockSignals(True)
                 self.visuals_btn.setChecked(False)
                 self.visuals_btn.blockSignals(False)
                 self.visuals_btn.setText("AI FX: OFF")
-        except Exception:
-            self._visual_timer.stop()
-            self.state.visuals_enabled = False
             self.fx_background.set_visuals(False)
 
     def _apply_widget_style(self) -> None:
@@ -845,40 +1032,96 @@ class QuestWidget(QtWidgets.QWidget):
 
     def refresh(self) -> None:
         self._refresh_dirty = True
-        if self._refresh_pending:
+        if self._refresh_worker_busy or self._refresh_pending:
             return
         self._refresh_pending = True
-        QtCore.QTimer.singleShot(0, self._refresh_now)
+        QtCore.QTimer.singleShot(self._REFRESH_DEBOUNCE_MS, self._start_refresh_worker)
 
-    def _refresh_now(self) -> None:
+    def _start_refresh_worker(self) -> None:
         self._refresh_pending = False
         if not self._refresh_dirty:
             return
         self._refresh_dirty = False
-        try:
-            self.open_list.blockSignals(True)
-            self.open_list.clear()
-            for index, t in enumerate(self.db.list_tasks(status="open"), start=1):
-                label = f"{index}. {t.title}"
-                item = QtWidgets.QListWidgetItem(label)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, t.id)
-                item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
-                item.setSizeHint(self._size_hint_for_title(label))
-                self.open_list.addItem(item)
-            self.open_list.blockSignals(False)
+        self._refresh_seq += 1
+        seq = self._refresh_seq
+        self._refresh_worker_busy = True
+        self._visual_timer.stop()
+        db = self.db
 
-            self.done_list.clear()
-            for t in self.db.list_tasks(status="done"):
-                item = QtWidgets.QListWidgetItem(f"{t.title}")
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, t.id)
-                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-                item.setSizeHint(self._size_hint_for_title(t.title))
-                self.done_list.addItem(item)
-        except Exception:
-            pass
+        def worker() -> None:
+            snapshot: Optional[_QuestListSnapshot] = None
+            try:
+                open_tasks = db.list_tasks(status="open")
+                done_tasks = db.list_tasks(status="done")
+                total = len(open_tasks) + len(done_tasks)
+                use_compact = total > QuestWidget._COMPACT_LIST_THRESHOLD
+                open_rows = [(t.id, index, t.title) for index, t in enumerate(open_tasks, start=1)]
+                done_rows = [(t.id, t.title) for t in done_tasks]
+                snapshot = _QuestListSnapshot(open_rows, done_rows, use_compact)
+            except Exception as exc:
+                log_diagnostic("ui", "refresh worker failed", exc=exc)
+            try:
+                self._refresh_data_ready.emit(seq, snapshot)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, name="QuestRefresh", daemon=True).start()
+
+    @QtCore.Slot(int, object)
+    def _on_refresh_data_ready(self, seq: int, snapshot: object) -> None:
+        if seq != self._refresh_seq:
+            return
+        self._refresh_worker_busy = False
+        if isinstance(snapshot, _QuestListSnapshot):
+            self._apply_refresh_snapshot(snapshot)
         if self._refresh_dirty:
             self.refresh()
+        else:
+            self._sync_fx_timer()
+
+    def _apply_refresh_snapshot(self, snapshot: _QuestListSnapshot) -> None:
+        self._refreshing_lists = True
+        try:
+            self.setUpdatesEnabled(False)
+            self.open_list.blockSignals(True)
+            self.done_list.blockSignals(True)
+
+            self.open_list.setUniformItemSizes(snapshot.use_compact)
+            self.open_list.clear()
+            for task_id, number, title in snapshot.open_rows:
+                item = QtWidgets.QListWidgetItem(title)
+                item.setData(_ROLE_TASK_ID, task_id)
+                item.setData(_ROLE_QUEST_NUM, number)
+                item.setFlags(
+                    item.flags()
+                    | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+                    | QtCore.Qt.ItemFlag.ItemIsEditable
+                )
+                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+                if not snapshot.use_compact:
+                    item.setSizeHint(self._size_hint_for_title(f"{number}. {title}"))
+                self.open_list.addItem(item)
+
+            self.done_list.setUniformItemSizes(snapshot.use_compact)
+            self.done_list.clear()
+            for task_id, title in snapshot.done_rows:
+                item = QtWidgets.QListWidgetItem(title)
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, task_id)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                if not snapshot.use_compact:
+                    item.setSizeHint(self._size_hint_for_title(title))
+                self.done_list.addItem(item)
+        except Exception as exc:
+            log_diagnostic("ui", "refresh apply failed", exc=exc)
+        finally:
+            self.open_list.blockSignals(False)
+            self.done_list.blockSignals(False)
+            self.setUpdatesEnabled(True)
+            self._refreshing_lists = False
+
+    def _refresh_now(self) -> None:
+        """Legacy entry point — route through the async worker."""
+        self.refresh()
 
     def _handle_input(self) -> None:
         text = self.input.text().strip()
@@ -890,43 +1133,166 @@ class QuestWidget(QtWidgets.QWidget):
     def _apply_text(self, text: str, source: str) -> None:
         try:
             self._apply_text_impl(text, source=source)
-        except Exception:
-            return
+        except Exception as exc:
+            log_diagnostic("ui", f"apply_text failed ({source}): {text!r}", exc=exc)
+            self.footer.setText("Something went wrong. See ~/.quest_assistant/diagnostic.log")
 
     def _apply_text_impl(self, text: str, source: str) -> None:
         self._spoke_this_turn = False
         self._last_command_text = text
-        self._llm_seq += 1
         self._expire_pending_add_if_needed()
+        self._expire_pending_delete_if_needed()
         if self._pending_voice_add and self._should_cancel_pending_add(text):
             self._set_pending_add(False)
             self._set_footer_default()
 
-        # 1) Instant, deterministic handling (no network, never freezes the UI).
-        if self._try_apply_parser_control_action(text):
-            self.refresh()
-            return
-        if self._try_apply_casual_intent(text):
-            self.refresh()
-            return
-        if self._apply_parser_actions(text, source):
-            self.refresh()
+        if self._pending_voice_delete and self._try_apply_pending_delete(text):
+            self._complete_instant_command()
             return
 
-        # 2) Natural-language understanding via the local model, OFF the UI thread.
-        if self.brain.is_enabled and self._should_dispatch_llm(text):
+        # Mic/privacy off — instant, before anything else (no LLM wait).
+        if looks_like_listen_off(text):
+            if self._apply_nonquest_llm_action(LLMAction(kind="listen_off")):
+                self._complete_instant_command()
+                return
+
+        # Deterministic controls (FX, show, hide, etc.) before the LLM — avoids misheard deletes.
+        if self._try_apply_fx_command(text):
+            self._complete_instant_command()
+            return
+        if self._try_apply_parser_control_action(text):
+            self._complete_instant_command()
+            return
+        if self._try_apply_casual_intent(text):
+            self._complete_instant_command()
+            return
+
+        if looks_like_delete_intent(text) and self._try_apply_quest_command(text, source):
+            self._complete_instant_command()
+            return
+
+        if self._try_apply_quest_command(text, source):
+            self._complete_instant_command()
+            return
+
+        # Add / collect quests locally — never send "add task" or the next title to the LLM first.
+        if source == "voice" and self.state.jarvis_awake and (
+            self._pending_voice_add or has_add_intent(text)
+        ):
+            if self._apply_parser_actions(text, source):
+                self._complete_instant_command()
+                return
+
+        # When Jarvis is awake, prefer natural-language understanding for voice.
+        if (
+            source == "voice"
+            and self.state.jarvis_awake
+            and self.brain.may_use_ollama
+            and self._should_dispatch_llm_awake(text)
+        ):
+            self._llm_seq += 1
             if self._dispatch_llm(text, source, self._llm_seq):
                 return
 
+        if self._apply_parser_actions(text, source):
+            self._complete_instant_command()
+            return
+
+        # Natural-language understanding via the local model, OFF the UI thread.
+        if self.brain.may_use_ollama and self._should_dispatch_llm(text):
+            self._llm_seq += 1
+            if self._dispatch_llm(text, source, self._llm_seq):
+                return
+
+        if source == "typed" and not looks_like_typed_quest(text):
+            self.footer.setText('Type a quest title, or say "add …" for voice-style commands.')
+            return
+
+        if self._try_voice_conversation_fallback(text, source):
+            self.refresh()
+            return
+
         self.refresh()
+
+    def _resolve_fx_for_voice(self, text: str) -> Optional[bool]:
+        fx = resolve_fx_enabled(text)
+        if fx is not None:
+            return fx
+        if not self._fx_is_visually_on() or looks_like_listen_off(text):
+            return None
+        raw = normalize_voice_command(text)
+        if not raw:
+            return None
+        lower = raw.lower()
+        if re.search(r"\b(?:turn|switch|shut)\s+(?:it|them|those)\s+off\b", lower):
+            return False
+        if re.search(r"\b(?:turn|switch)\s+off\b", lower) and re.search(
+            r"\b(?:fx|effects?|visuals?|animations?|glow(?:ing)?|flashy|lights?)\b",
+            lower,
+        ):
+            return False
+        return None
+
+    def _try_apply_fx_command(self, text: str) -> bool:
+        fx = self._resolve_fx_for_voice(text)
+        if fx is None:
+            return False
+        return self._apply_nonquest_llm_action(
+            LLMAction(kind="set_fx", value="on" if fx else "off")
+        )
+
+    def _try_apply_quest_command(self, text: str, source: str) -> bool:
+        action = parse_action(text, allow_implicit_add=False)
+        if action.kind == "delete":
+            if action.quest_number is not None:
+                self._set_pending_delete(False)
+                self._delete_open_quest(number=action.quest_number)
+                return True
+            if action.title and not is_delete_title_placeholder(action.title):
+                self._set_pending_delete(False)
+                self._delete_open_quest(title=action.title)
+                return True
+            number = extract_delete_quest_number(text)
+            if number is not None:
+                self._set_pending_delete(False)
+                self._delete_open_quest(number=number)
+                return True
+            if looks_like_delete_intent(text):
+                self._set_pending_add(False)
+                self._set_pending_delete(True)
+                self.footer.setText("Say the quest name or number to delete.")
+                self._jarvis_say("Which quest should I delete, sir? Say the name or task number.")
+                return True
+            return False
+        if action.kind == "complete" and (action.title is not None or action.quest_number is not None):
+            self._complete_open_quest(title=action.title, number=action.quest_number)
+            return True
+        if action.kind == "edit" and action.value and (action.title is not None or action.quest_number is not None):
+            self._edit_open_quest(new_title=action.value, title=action.title, number=action.quest_number)
+            return True
+        return False
+
+    def _allow_implicit_add(self, text: str, source: str) -> bool:
+        if looks_like_chat(text):
+            return False
+        if self._pending_voice_delete:
+            return False
+        if self._pending_voice_add:
+            return True
+        if has_add_intent(text):
+            return True
+        if source == "typed":
+            return looks_like_typed_quest(text)
+        return False
 
     def _apply_parser_actions(self, text: str, source: str) -> bool:
         matched_parser = False
         items = [text] if extract_add_titles(text) or self._pending_voice_add else split_into_items(text)
+        implicit_add = self._allow_implicit_add(text, source)
         for item in items:
             action = parse_action(
                 item,
-                allow_implicit_add=source == "typed" or self._pending_voice_add,
+                allow_implicit_add=implicit_add,
             )
             if action.kind != "noop":
                 matched_parser = True
@@ -944,18 +1310,22 @@ class QuestWidget(QtWidgets.QWidget):
                 titles = [t for t in (normalize_quest_title(title) for title in titles) if t]
 
                 if titles:
+                    added = 0
                     for title in titles:
-                        self.db.add_task(
+                        if self.db.add_task(
                             title,
                             due_iso=action.due_iso,
                             source=source,
                             raw_input=action.raw,
-                        )
+                        ) is not None:
+                            added += 1
+                    if not added:
+                        continue
                     self.sfx.play("add")
-                    if len(titles) == 1:
+                    if added == 1:
                         self._jarvis_say(f"Done, sir. I added the quest: {titles[0]}.")
                     else:
-                        self._jarvis_say(f"Done, sir. I added {len(titles)} quests.")
+                        self._jarvis_say(f"Done, sir. I added {added} quests.")
                     should_continue_collection = (
                         source == "voice"
                         and self._pending_voice_add
@@ -982,7 +1352,41 @@ class QuestWidget(QtWidgets.QWidget):
                 self._delete_open_quest(title=action.title, number=action.quest_number)
                 continue
 
+            if action.kind == "edit" and action.value and (action.title or action.quest_number is not None):
+                self._edit_open_quest(
+                    new_title=action.value,
+                    title=action.title,
+                    number=action.quest_number,
+                )
+                continue
+
         return matched_parser or self._spoke_this_turn
+
+    def _should_dispatch_llm_awake(self, text: str) -> bool:
+        cleaned = " ".join((text or "").split())
+        if len(cleaned) < 2:
+            return False
+        words = [w.strip(".,!?;:") for w in cleaned.lower().split()]
+        if not words:
+            return False
+        if len(words) == 1 and words[0] in QuestWidget._VOICE_FILLER_WORDS:
+            return False
+        if self._pending_voice_add or has_add_intent(text):
+            return False
+        if self._pending_voice_delete:
+            return False
+        if looks_like_listen_off(text) or parse_quit_intent(text):
+            return False
+        if resolve_fx_enabled(text) is not None:
+            return False
+        if (
+            has_delete_intent(text)
+            or looks_like_delete_intent(text)
+            or has_complete_intent(text)
+            or has_edit_intent(text)
+        ):
+            return False
+        return True
 
     @staticmethod
     def _should_dispatch_llm(text: str) -> bool:
@@ -997,40 +1401,78 @@ class QuestWidget(QtWidgets.QWidget):
         # Skip the model for obvious control phrases the parser already understands.
         if parse_fx_enabled(text) is not None:
             return False
-        if parse_hide_intent(text) or parse_quit_intent(text):
+        if parse_hide_intent(text) or parse_quit_intent(text) or looks_like_listen_off(text):
+            return False
+        if parse_open_browser_intent(text) or parse_web_search_query(text):
             return False
         if has_add_intent(text):
             return False
         quick = parse_action(text, allow_implicit_add=False)
-        if quick.kind in {"show", "hide", "listen_off", "add_done", "quit", "complete", "delete", "add"}:
+        if quick.kind in {
+            "show",
+            "hide",
+            "listen_off",
+            "add_done",
+            "quit",
+            "complete",
+            "delete",
+            "edit",
+            "add",
+            "open_browser",
+            "web_search",
+        }:
             return False
         return True
 
     def _dispatch_llm(self, text: str, source: str, seq: int) -> bool:
         if self._llm_busy:
             if source == "voice":
-                self._pending_llm_request = (text, source)
+                # Keep only the latest utterance — draining a backlog feels laggy.
+                self._pending_llm_requests = [(text, source)]
             return False
         self._llm_busy = True
         self._llm_active_seq = seq
-        if source == "voice":
-            self._pause_fx_for_llm()
+        self.footer.setText("Working on it, sir…")
+        self._pause_fx_for_llm()
         pending_add = self._pending_voice_add
         jarvis_awake = self.state.jarvis_awake
-        open_quests = self._open_quests_for_llm()
         dispatch_seq = seq
+        brain = self.brain
+        db = self.db
 
         def worker() -> None:
             result = None
             try:
-                result = self.brain.interpret(
-                    text,
-                    pending_add=pending_add,
-                    jarvis_awake=jarvis_awake,
-                    open_quests=open_quests,
-                    source=source,
-                )
-            except Exception:
+                open_quests = [
+                    {"number": index, "title": task.title}
+                    for index, task in enumerate(db.list_tasks(status="open"), start=1)
+                ]
+                fx = resolve_fx_enabled(text)
+                if fx is not None:
+                    result = LLMResult(
+                        actions=[LLMAction(kind="set_fx", value="on" if fx else "off")],
+                        elapsed_s=0.0,
+                        model=brain.model,
+                    )
+                elif looks_like_delete_intent(text) or has_delete_intent(text):
+                    result = None
+                elif source == "voice" and jarvis_awake:
+                    result = brain.interpret_voice(
+                        text,
+                        pending_add=pending_add,
+                        jarvis_awake=jarvis_awake,
+                        open_quests=open_quests,
+                    )
+                else:
+                    result = brain.interpret(
+                        text,
+                        pending_add=pending_add,
+                        jarvis_awake=jarvis_awake,
+                        open_quests=open_quests,
+                        source=source,
+                    )
+            except Exception as exc:
+                log_diagnostic("llm", "interpret worker failed", exc=exc)
                 result = None
             finally:
                 try:
@@ -1038,18 +1480,24 @@ class QuestWidget(QtWidgets.QWidget):
                 except Exception:
                     pass
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, name="LLMWorker", daemon=True).start()
         return True
 
     def _finish_llm_turn(self) -> None:
         self._llm_busy = False
         self._resume_fx_for_llm()
-        pending = self._pending_llm_request
-        self._pending_llm_request = None
-        if pending:
-            pending_text, pending_source = pending
-            if self.brain.is_enabled and self._should_dispatch_llm(pending_text):
+        self._sync_fx_timer()
+        while self._pending_llm_requests:
+            pending_text, pending_source = self._pending_llm_requests.pop(0)
+            should = (
+                self._should_dispatch_llm_awake(pending_text)
+                if pending_source == "voice" and self.state.jarvis_awake
+                else self._should_dispatch_llm(pending_text)
+            )
+            if self.brain.may_use_ollama and should:
+                self._llm_seq += 1
                 self._dispatch_llm(pending_text, pending_source, self._llm_seq)
+                return
 
     @QtCore.Slot(int, str, str, object)
     def _on_llm_result(self, seq: int, text: str, source: str, result: object) -> None:
@@ -1057,18 +1505,50 @@ class QuestWidget(QtWidgets.QWidget):
             if seq == self._llm_seq:
                 self._spoke_this_turn = False
                 self._last_command_text = text
+                if self._try_apply_fx_command(text):
+                    self._set_footer_default()
+                    self.refresh()
+                    return
+                if self._try_apply_pending_delete(text):
+                    self._set_footer_default()
+                    self.refresh()
+                    return
+                if self._try_apply_quest_command(text, source):
+                    self._set_footer_default()
+                    self.refresh()
+                    return
+                if self._pending_voice_add and self._apply_parser_actions(text, source):
+                    self._set_footer_default()
+                    self.refresh()
+                    return
                 if result is not None and self._apply_llm_result(text, source, result):
+                    self._set_footer_default()
                     self.refresh()
                     return
                 if self._apply_parser_actions(text, source):
+                    self._set_footer_default()
                     self.refresh()
                     return
+                if self._try_voice_conversation_fallback(text, source):
+                    self._set_footer_default()
+                    self.refresh()
+                    return
+                self._set_footer_default()
                 self.refresh()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_diagnostic("ui", "llm result handling failed", exc=exc)
         finally:
             if seq == self._llm_active_seq:
                 self._finish_llm_turn()
+                if not self._llm_busy:
+                    self._set_footer_default()
+
+    def _complete_instant_command(self) -> None:
+        """Parser handled the utterance immediately — clear any stale LLM wait state."""
+        if self._llm_busy:
+            self._llm_seq += 1
+        self._set_footer_default()
+        self.refresh()
 
     def _finish_quest_mutation(self) -> None:
         self._set_pending_add(False)
@@ -1096,8 +1576,7 @@ class QuestWidget(QtWidgets.QWidget):
         if number is not None:
             return self.db.get_open_task_by_number(number)
         if title:
-            matches = self.db.find_open_by_title_contains(title, limit=1)
-            return matches[0] if matches else None
+            return self.db.find_best_open_by_title(title)
         return None
 
     def _complete_open_quest(
@@ -1132,8 +1611,7 @@ class QuestWidget(QtWidgets.QWidget):
         if number is not None:
             task = self.db.get_open_task_by_number(number)
         elif title:
-            matches = self.db.find_by_title_contains(title, limit=1)
-            task = matches[0] if matches else None
+            task = self.db.find_best_open_by_title(title)
 
         if task:
             self.db.delete_task(task.id)
@@ -1150,12 +1628,50 @@ class QuestWidget(QtWidgets.QWidget):
                 self._jarvis_say(f"I could not find an open quest matching {title}.")
         self._finish_quest_mutation()
 
+    def _edit_open_quest(
+        self,
+        *,
+        new_title: str,
+        title: Optional[str] = None,
+        number: Optional[int] = None,
+    ) -> None:
+        cleaned = normalize_quest_title(new_title)
+        if not cleaned:
+            self.sfx.play("error")
+            self._jarvis_say("I need a new quest title, sir.")
+            return
+
+        task = self._resolve_open_quest(title=title, number=number)
+        if not task:
+            self.sfx.play("error")
+            if number is not None:
+                self._jarvis_say(f"I could not find open task {number}, sir.")
+            else:
+                self._jarvis_say(f"I could not find an open quest matching {title}.")
+            self._finish_quest_mutation()
+            return
+
+        if task.title == cleaned:
+            self._jarvis_say("That quest already has that title, sir.")
+            self._finish_quest_mutation()
+            return
+
+        if not self.db.update_task_title(task.id, cleaned):
+            self.sfx.play("error")
+            self._jarvis_say("I could not update that quest, sir.")
+            self._finish_quest_mutation()
+            return
+
+        self.sfx.play("add")
+        if number is not None:
+            self._jarvis_say(f"Task {number} updated to {cleaned}.")
+        else:
+            self._jarvis_say(f"Quest updated to {cleaned}.")
+        self._finish_quest_mutation()
+
     def _try_apply_parser_control_action(self, text: str) -> bool:
-        fx_enabled = parse_fx_enabled(text)
-        if fx_enabled is not None:
-            return self._apply_nonquest_llm_action(
-                LLMAction(kind="set_fx", value="on" if fx_enabled else "off")
-            )
+        if looks_like_listen_off(text):
+            return self._apply_nonquest_llm_action(LLMAction(kind="listen_off"))
 
         if parse_hide_intent(text):
             return self._apply_nonquest_llm_action(LLMAction(kind="hide"))
@@ -1163,9 +1679,28 @@ class QuestWidget(QtWidgets.QWidget):
         if parse_quit_intent(text):
             return self._apply_nonquest_llm_action(LLMAction(kind="quit"))
 
+        if parse_open_browser_intent(text):
+            return self._apply_nonquest_llm_action(LLMAction(kind="open_browser"))
+
+        query = parse_web_search_query(text)
+        if query:
+            return self._apply_nonquest_llm_action(LLMAction(kind="web_search", value=query))
+
         action = parse_action(text, allow_implicit_add=False)
-        if action.kind not in {"show", "hide", "listen_off", "add_done", "quit"}:
+        if action.kind not in {
+            "show",
+            "hide",
+            "listen_off",
+            "add_done",
+            "quit",
+            "open_browser",
+            "web_search",
+        }:
             return False
+        if action.kind == "web_search":
+            return self._apply_nonquest_llm_action(LLMAction(kind="web_search", value=action.value))
+        if action.kind == "open_browser":
+            return self._apply_nonquest_llm_action(LLMAction(kind="open_browser"))
         return self._apply_nonquest_llm_action(LLMAction(kind=action.kind, title=action.title))
 
     def _open_quests_for_llm(self) -> list[dict[str, object]]:
@@ -1179,28 +1714,57 @@ class QuestWidget(QtWidgets.QWidget):
         if not action:
             return False
         if action.kind == "set_fx":
-            return self._apply_nonquest_llm_action(
-                LLMAction(kind="set_fx", value=action.value or "on")
-            )
+            return self._try_apply_fx_command(text)
         if action.kind == "quit":
             return parse_quit_intent(text) and self._apply_nonquest_llm_action(LLMAction(kind="quit"))
         if action.kind in {"show", "hide", "listen_off"}:
+            if action.kind == "listen_off" and not looks_like_listen_off(text):
+                return False
             return self._apply_nonquest_llm_action(LLMAction(kind=action.kind))
         return False
 
-    def _try_apply_llm_actions(self, text: str, *, source: str) -> bool:
-        result = self.brain.interpret(
-            text,
-            pending_add=self._pending_voice_add,
-            jarvis_awake=self.state.jarvis_awake,
-            open_quests=self._open_quests_for_llm(),
-            source=source,
-        )
-        if not result:
+    def _try_voice_conversation_fallback(self, text: str, source: str) -> bool:
+        if source != "voice" or self._spoke_this_turn:
             return False
-        return self._apply_llm_result(text, source, result)
+        if not self.state.jarvis_awake or not self.state.listening_requested:
+            return False
+
+        if looks_like_listen_off(text):
+            return self._apply_nonquest_llm_action(LLMAction(kind="listen_off"))
+
+        cleaned = " ".join((text or "").split())
+        if len(cleaned) < 2:
+            return False
+
+        offline = local_chat_reply(text)
+        if offline:
+            self._jarvis_say(offline)
+            return True
+
+        if looks_like_chat(text):
+            if self.brain.may_use_ollama:
+                self._llm_seq += 1
+                if self._dispatch_llm(text, source, self._llm_seq):
+                    return True
+            self._jarvis_say(
+                "I can chat more freely when Ollama is running on this PC, sir."
+            )
+            return True
+
+        if not self.brain.may_use_ollama:
+            self._jarvis_say(
+                "I can manage quests, effects, and searches when Ollama is running on this PC, sir."
+            )
+            return True
+
+        return False
 
     def _apply_llm_result(self, text: str, source: str, result: object) -> bool:
+        if self._try_apply_fx_command(text):
+            return True
+        delete_like = looks_like_delete_intent(text) or has_delete_intent(text)
+        if delete_like and self._try_apply_quest_command(text, source):
+            return True
         if result is None:
             return False
         result_actions = getattr(result, "actions", None)
@@ -1216,7 +1780,19 @@ class QuestWidget(QtWidgets.QWidget):
                     return True
             return False
 
-        allow_add_actions = self._pending_voice_add or has_add_intent(text) or bool(extract_add_titles(text))
+        allow_add_actions = (
+            not delete_like
+            and not looks_like_delete_intent(text)
+            and not has_delete_intent(text)
+            and not has_complete_intent(text)
+            and not has_edit_intent(text)
+            and not looks_like_chat(text)
+            and (
+                self._pending_voice_add
+                or has_add_intent(text)
+                or bool(extract_add_titles(text))
+            )
+        )
         add_titles: list[str] = []
         completed = 0
         deleted = 0
@@ -1234,12 +1810,23 @@ class QuestWidget(QtWidgets.QWidget):
                     if self._apply_nonquest_llm_action(LLMAction(kind="hide")):
                         handled = True
                 continue
+            if action.kind == "listen_off" and not looks_like_listen_off(text):
+                continue
             if self._apply_nonquest_llm_action(action):
                 handled = True
                 continue
 
             if action.kind == "add":
                 if not allow_add_actions:
+                    continue
+                if delete_like:
+                    number = extract_delete_quest_number(text)
+                    if number is not None:
+                        task = self.db.get_open_task_by_number(number)
+                        if task:
+                            self.db.delete_task(task.id)
+                            deleted += 1
+                            handled = True
                     continue
                 if action.title:
                     title = normalize_quest_title(action.title)
@@ -1251,6 +1838,8 @@ class QuestWidget(QtWidgets.QWidget):
                 continue
 
             if action.kind == "complete":
+                if not has_complete_intent(text) and not (self.state.jarvis_awake and source == "voice"):
+                    continue
                 title = action.title
                 number = self._quest_number_from_llm_title(title or "")
                 if number is not None:
@@ -1263,6 +1852,17 @@ class QuestWidget(QtWidgets.QWidget):
                 continue
 
             if action.kind == "delete":
+                if not looks_like_delete_intent(text) and not has_delete_intent(text):
+                    continue
+                allow_multi = bool(
+                    re.search(
+                        r"\b(?:all|both|everything|each|every)\b|\band\b|\d+\s*(?:,|and)\s*\d+",
+                        text,
+                        re.IGNORECASE,
+                    )
+                )
+                if deleted >= 1 and not allow_multi:
+                    continue
                 number = self._quest_number_from_llm_title(action.title or "")
                 title = None if number is not None else action.title
                 if number is not None:
@@ -1271,27 +1871,55 @@ class QuestWidget(QtWidgets.QWidget):
                         self.db.delete_task(task.id)
                         deleted += 1
                 elif title:
-                    matches = self.db.find_by_title_contains(title, limit=1)
-                    if matches:
-                        self.db.delete_task(matches[0].id)
+                    task = self.db.find_best_open_by_title(title)
+                    if task:
+                        self.db.delete_task(task.id)
                         deleted += 1
+                continue
+
+            if action.kind == "edit":
+                if not action.value:
+                    continue
+                if not has_edit_intent(text) and not re.search(
+                    r"\b(?:edit|rename|change|fix|correct|update|call)\b",
+                    text,
+                    re.IGNORECASE,
+                ):
+                    continue
+                new_title = action.value
+                if not new_title:
+                    continue
+                number = self._quest_number_from_llm_title(action.title or "")
+                old_title = None if number is not None else action.title
+                if number is not None or old_title:
+                    task = self._resolve_open_quest(title=old_title, number=number)
+                    updated = normalize_quest_title(new_title) or new_title
+                    if task and self.db.update_task_title(task.id, updated):
+                        handled = True
+                        self.sfx.play("add")
+                        if number is not None:
+                            self._jarvis_say(f"Task {number} updated to {updated}.")
+                        else:
+                            self._jarvis_say(f"Quest updated to {updated}.")
                 continue
 
             if action.kind == "reply" and action.value:
                 replies.append(action.value)
                 continue
 
+        added_count = 0
         for title in add_titles:
-            self.db.add_task(title, source=f"{source}:llm", raw_input=text)
+            if self.db.add_task(title, source=f"{source}:llm", raw_input=text) is not None:
+                added_count += 1
 
-        if add_titles:
+        if added_count:
             handled = True
             self.sfx.play("add")
             self._set_pending_add(False)
-            if len(add_titles) == 1:
+            if added_count == 1:
                 self._jarvis_say(f"Done, sir. I added the quest: {add_titles[0]}.")
             else:
-                self._jarvis_say(f"Done, sir. I added {len(add_titles)} quests.")
+                self._jarvis_say(f"Done, sir. I added {added_count} quests.")
         elif completed:
             handled = True
             self.sfx.play("complete")
@@ -1343,11 +1971,12 @@ class QuestWidget(QtWidgets.QWidget):
             return True
 
         if action.kind == "listen_off":
-            self._jarvis_say("Mic off, sir.")
+            if not looks_like_listen_off(self._last_command_text or ""):
+                return False
             if not self.state.listening_requested:
+                self._jarvis_say("Mic is already off, sir.")
                 return True
-            if not self._should_accept_control_action("listen_off"):
-                return True
+            self._jarvis_say("Mic off, sir.")
             self._after_speech_begins(lambda: (self.sfx.play("mute"), self.disable_listening()), delay_ms=800)
             self._set_pending_add(False)
             return True
@@ -1368,13 +1997,14 @@ class QuestWidget(QtWidgets.QWidget):
 
         if action.kind == "set_fx":
             enabled = (action.value or "").strip().lower() in {"on", "true", "enable", "enabled"}
-            if self.state.visuals_enabled == enabled:
-                self._jarvis_say("Effects are already on, sir." if enabled else "Effects are already off, sir.")
+            if enabled and self._fx_is_visually_on():
+                self._jarvis_say("Effects are already on, sir.")
                 return True
+            if not enabled and not self._fx_is_visually_on():
+                self._jarvis_say("Effects are already off, sir.")
+                return True
+            self._set_visuals_enabled(enabled)
             self._jarvis_say("Effects on." if enabled else "Effects off.")
-            # Enable visuals on the next event-loop tick so TTS can start first,
-            # without stacking a long timer on top of speech playback.
-            QtCore.QTimer.singleShot(0, lambda enabled=enabled: self._apply_fx_enabled(enabled))
             return True
 
         if action.kind == "open_browser":
@@ -1463,11 +2093,65 @@ class QuestWidget(QtWidgets.QWidget):
     def _set_pending_add(self, enabled: bool) -> None:
         self._pending_voice_add = enabled
         self._pending_voice_add_until = time.monotonic() + self._ADD_MODE_TIMEOUT_S if enabled else 0.0
+        if enabled:
+            self._set_pending_delete(False)
+
+    def _set_pending_delete(self, enabled: bool) -> None:
+        self._pending_voice_delete = enabled
+        self._pending_voice_delete_until = time.monotonic() + self._ADD_MODE_TIMEOUT_S if enabled else 0.0
+        if enabled:
+            self._set_pending_add(False)
 
     def _expire_pending_add_if_needed(self) -> None:
         if self._pending_voice_add and time.monotonic() > self._pending_voice_add_until:
             self._set_pending_add(False)
             self._set_footer_default()
+
+    def _expire_pending_delete_if_needed(self) -> None:
+        if self._pending_voice_delete and time.monotonic() > self._pending_voice_delete_until:
+            self._set_pending_delete(False)
+            self._set_footer_default()
+
+    def _try_apply_pending_delete(self, text: str) -> bool:
+        if not self._pending_voice_delete:
+            return False
+        if looks_like_listen_off(text) or parse_quit_intent(text):
+            self._set_pending_delete(False)
+            return False
+
+        action = parse_action(text, allow_implicit_add=False)
+        if action.kind == "delete":
+            if action.quest_number is not None:
+                self._set_pending_delete(False)
+                self._delete_open_quest(number=action.quest_number)
+                return True
+            if action.title and not is_delete_title_placeholder(action.title):
+                self._set_pending_delete(False)
+                self._delete_open_quest(title=action.title)
+                return True
+
+        if has_add_intent(text):
+            self._set_pending_delete(False)
+            return False
+
+        raw = normalize_voice_command(text)
+        if not raw:
+            return False
+
+        words = raw.split()
+        if len(words) == 1:
+            number = parse_quest_number(words[0])
+            if number is not None:
+                self._set_pending_delete(False)
+                self._delete_open_quest(number=number)
+                return True
+
+        title = normalize_quest_title(raw)
+        if not title:
+            return False
+        self._set_pending_delete(False)
+        self._delete_open_quest(title=title)
+        return True
 
     @staticmethod
     def _should_cancel_pending_add(text: str) -> bool:
@@ -1567,6 +2251,21 @@ class QuestWidget(QtWidgets.QWidget):
             QtCore.Q_ARG(str, text),
         )
 
+    def _on_voice_error(self, message: str) -> None:
+        QtCore.QMetaObject.invokeMethod(
+            self,
+            "_on_voice_error_ui",
+            QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(str, message),
+        )
+
+    @QtCore.Slot(str)
+    def _on_voice_error_ui(self, message: str) -> None:
+        if not self.state.listening_requested:
+            return
+        self.footer.setText(message)
+        self.listen_btn.setText("Listening: ERROR")
+
     @QtCore.Slot(str)
     def _on_voice_text_ui(self, text: str) -> None:
         try:
@@ -1579,32 +2278,43 @@ class QuestWidget(QtWidgets.QWidget):
             if self._is_duplicate_voice_text(text):
                 return
             self._queue_voice_command(text)
-        except Exception:
-            pass
+        except Exception as exc:
+            log_diagnostic("ui", f"voice text handling failed: {text!r}", exc=exc)
 
     def _queue_voice_command(self, text: str) -> None:
-        self._queued_voice_text = text
+        text = (text or "").strip()
+        if not text:
+            return
+        self._voice_command_queue.append(text)
+        dropped = 0
+        if len(self._voice_command_queue) > self._VOICE_QUEUE_MAX:
+            dropped = len(self._voice_command_queue) - self._VOICE_QUEUE_MAX
+            self._voice_command_queue = self._voice_command_queue[-self._VOICE_QUEUE_MAX :]
+        if dropped:
+            self.footer.setText(f"Dropped {dropped} older voice command(s) — queue full.")
         if self._voice_command_busy:
             return
         self._voice_command_busy = True
+        self._visual_timer.stop()
         QtCore.QTimer.singleShot(0, self._process_queued_voice_command)
 
     @QtCore.Slot()
     def _process_queued_voice_command(self) -> None:
-        text = self._queued_voice_text
-        self._queued_voice_text = ""
-        if not text:
+        if not self._voice_command_queue:
             self._voice_command_busy = False
+            self._sync_fx_timer()
             return
+        self._visual_timer.stop()
+        text = self._voice_command_queue.pop(0)
         try:
             self._apply_text(text, source="voice")
-        except Exception:
-            pass
-        finally:
-            if self._queued_voice_text:
-                QtCore.QTimer.singleShot(0, self._process_queued_voice_command)
-            else:
-                self._voice_command_busy = False
+        except Exception as exc:
+            log_diagnostic("ui", f"queued voice command failed: {text!r}", exc=exc)
+        if self._voice_command_queue:
+            QtCore.QTimer.singleShot(50, self._process_queued_voice_command)
+        else:
+            self._voice_command_busy = False
+            self._sync_fx_timer()
 
     @classmethod
     def _is_meaningful_voice_text(cls, text: str) -> bool:
@@ -1634,8 +2344,11 @@ class QuestWidget(QtWidgets.QWidget):
     def _on_speaker_state_ui(self, speaking: bool) -> None:
         self._jarvis_speaking = speaking
         self.voice.set_results_muted(speaking)
-        if not speaking:
+        if speaking:
+            self._visual_timer.stop()
+        else:
             self._voice_grace_until = time.monotonic() + self._VOICE_GRACE_AFTER_SPEECH_S
+            self._sync_fx_timer()
 
     def _jarvis_say(self, text: str, *, on_done: Optional[Callable[[], None]] = None) -> None:
         text = (text or "").strip()
@@ -1671,22 +2384,35 @@ class QuestWidget(QtWidgets.QWidget):
             if norm == spoken:
                 return True
             spoken_words = spoken.split()
-            # Only block short near-verbatim replays of Jarvis speech, not real
-            # commands that happen to contain the same words ("turn effects on").
-            if len(words) <= 5 and len(spoken_words) <= 6:
-                if norm in spoken or spoken in norm:
-                    return True
-                overlap = set(words) & set(spoken_words)
-                if len(words) >= 2 and len(overlap) >= len(words) - 1 and len(overlap) == len(spoken_words):
-                    return True
+            # Block near-verbatim replays of Jarvis speech only (same words, same order).
+            if len(words) <= 5 and len(spoken_words) <= 6 and words == spoken_words:
+                return True
         return False
 
     def _on_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
-        task_id = int(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        if self._refreshing_lists:
+            return
+        if item.listWidget() is self.open_list:
+            self._on_open_item_changed(item)
+
+    def _on_open_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
+        task_id = int(item.data(_ROLE_TASK_ID))
         if item.checkState() == QtCore.Qt.CheckState.Checked:
             self.db.set_status(task_id, "done")
             self.sfx.play("complete")
             self.refresh()
+            return
+
+        new_title = normalize_quest_title(item.text())
+        task = self.db.get_task(task_id)
+        if task is None:
+            self.refresh()
+            return
+        if not new_title or new_title == task.title:
+            return
+        if self.db.update_task_title(task_id, new_title):
+            self.sfx.play("add")
+        self.refresh()
 
     def _delete_selected_from(self, task_list: QtWidgets.QListWidget) -> None:
         items = task_list.selectedItems()
@@ -1746,7 +2472,7 @@ class QuestWidget(QtWidgets.QWidget):
             and not self._voice_start_pending
         ):
             self._begin_voice_listener()
-        self._resume_fx_render()
+        self._sync_fx_timer()
         self._sync_voice_gate()
         self._sync_privacy_button()
 
@@ -1761,7 +2487,7 @@ class QuestWidget(QtWidgets.QWidget):
             and not self._voice_start_pending
         ):
             self._begin_voice_listener()
-        self._resume_fx_render()
+        self._sync_fx_timer()
         self._sync_voice_gate()
         self._sync_privacy_button()
 

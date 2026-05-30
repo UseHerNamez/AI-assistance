@@ -31,9 +31,20 @@ class SoundEffects:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
+    _MAX_PENDING = 3
+
     def play(self, name: str) -> None:
-        if self.enabled and winsound is not None:
-            self._queue.put(name)
+        if not self.enabled or winsound is None:
+            return
+        while self._queue.qsize() >= self._MAX_PENDING:
+            try:
+                dropped = self._queue.get_nowait()
+                if dropped is None:
+                    self._queue.put(None)
+                    return
+            except queue.Empty:
+                break
+        self._queue.put(name)
 
     def stop(self) -> None:
         self._queue.put(None)

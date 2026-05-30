@@ -13,8 +13,12 @@ import numpy as np
 import sounddevice as sd
 from vosk import KaldiRecognizer, Model
 
+from quest_assistant.diagnostics import log_diagnostic
+
 
 DEFAULT_MODEL_DIR = Path.home() / ".quest_assistant" / "models" / "vosk-model-small-en-us-0.15"
+_AUDIO_QUEUE_MAX = 32
+_THREAD_JOIN_S = 3.0
 
 _MODEL_CACHE: Optional[Model] = None
 _MODEL_CACHE_LOCK = threading.Lock()
@@ -93,13 +97,10 @@ class WakeWordGate:
         now = time.monotonic()
         lower = raw.lower()
 
-        # If wake word is present as a word boundary, arm and strip it.
-        # We allow forms like: "jarvis, ..." or "hey jarvis ..."
         wake_present = False
         if self.wake_word in lower.split():
             wake_present = True
         else:
-            # Fallback: handle punctuation glued to the wake word.
             tokens = [t.strip(".,!?;:") for t in lower.split()]
             wake_present = self.wake_word in tokens
 
@@ -108,7 +109,6 @@ class WakeWordGate:
             remainder = self._strip_wake_word(raw)
             return remainder or None
 
-        # If we're armed, pass through.
         if now <= self._armed_until:
             return raw
 
@@ -129,8 +129,10 @@ class VoiceListener:
         *,
         wake_word: str = "jarvis",
         command_window_s: float = 8.0,
+        on_error: Optional[Callable[[str], None]] = None,
     ):
         self.on_text = on_text
+        self.on_error = on_error
         self.config = config or VoiceConfig()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -140,6 +142,8 @@ class VoiceListener:
         self._gate_lock = threading.Lock()
         self._rec: Optional[KaldiRecognizer] = None
         self._results_muted = False
+        self._generation = 0
+        self.last_error: Optional[str] = None
 
     def set_wake_word_required(self, required: bool) -> None:
         with self._gate_lock:
@@ -155,8 +159,8 @@ class VoiceListener:
             if rec is not None:
                 try:
                     rec.Reset()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_diagnostic("voice", "recognizer reset failed", exc=exc)
 
     @property
     def is_running(self) -> bool:
@@ -167,24 +171,47 @@ class VoiceListener:
         thread = self._thread
         return thread is not None and thread.is_alive() and not self._running.is_set()
 
+    def _report_error(self, message: str, *, exc: BaseException | None = None) -> None:
+        self.last_error = message
+        log_diagnostic("voice", message, exc=exc)
+        if self.on_error:
+            try:
+                self.on_error(message)
+            except Exception as cb_exc:
+                log_diagnostic("voice", "on_error callback failed", exc=cb_exc)
+
+    def _clear_error(self) -> None:
+        self.last_error = None
+
     def start(self) -> None:
         thread = self._thread
         if thread is not None and thread.is_alive():
             if not self._stop.is_set():
                 return
-            thread.join(timeout=3.0)
+            self._stop.set()
+            thread.join(timeout=_THREAD_JOIN_S)
             if thread.is_alive():
-                return
+                # Abandon the stuck thread; a new generation tells it to exit quickly.
+                self._generation += 1
+                log_diagnostic("voice", "prior listener thread did not stop; starting a new one")
         self._thread = None
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._generation += 1
+        generation = self._generation
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(generation,),
+            name="VoiceListener",
+            daemon=True,
+        )
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self._generation += 1
         thread = self._thread
         if thread is not None and thread.is_alive():
-            thread.join(timeout=3.0)
+            thread.join(timeout=_THREAD_JOIN_S)
         self._thread = None
         self._running.clear()
         self._rec = None
@@ -196,25 +223,46 @@ class VoiceListener:
         self._stop.clear()
         self.start()
 
-    def _run(self) -> None:
+    def _run(self, generation: int) -> None:
+        if generation != self._generation:
+            return
+
         model_path = resolve_vosk_model_path()
         if not model_path:
+            self._report_error(
+                "Speech model not found. Run download_vosk_model.ps1 or set VOSK_MODEL_PATH."
+            )
             return
 
         try:
             model = _get_vosk_model(model_path)
-        except Exception:
+        except Exception as exc:
+            self._report_error("Failed to load the speech model.", exc=exc)
             return
+
+        if generation != self._generation or self._stop.is_set():
+            return
+
         rec = KaldiRecognizer(model, self.config.sample_rate)
         rec.SetWords(False)
         self._rec = rec
 
-        q: "queue.Queue[np.ndarray]" = queue.Queue()
+        audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=_AUDIO_QUEUE_MAX)
 
-        def callback(indata, frames, time, status):  # noqa: ANN001
-            if status:
+        def callback(indata, frames, time_info, status) -> None:  # noqa: ANN001
+            if self._stop.is_set() or generation != self._generation:
                 return
-            q.put(indata.copy().reshape(-1))
+            if status:
+                log_diagnostic("voice", f"audio input status: {status}")
+            chunk = indata.copy().reshape(-1)
+            try:
+                audio_q.put_nowait(chunk)
+            except queue.Full:
+                try:
+                    audio_q.get_nowait()
+                    audio_q.put_nowait(chunk)
+                except queue.Empty:
+                    pass
 
         try:
             stream = sd.InputStream(
@@ -225,16 +273,18 @@ class VoiceListener:
                 device=self.config.device,
                 blocksize=8000,
             )
-        except Exception:
+        except Exception as exc:
             self._rec = None
+            self._report_error("Microphone unavailable. Check Windows mic permissions.", exc=exc)
             return
 
+        self._clear_error()
         self._running.set()
         try:
             with stream:
-                while not self._stop.is_set():
+                while not self._stop.is_set() and generation == self._generation:
                     try:
-                        data = q.get(timeout=0.2)
+                        data = audio_q.get(timeout=0.2)
                     except queue.Empty:
                         continue
 
@@ -252,9 +302,9 @@ class VoiceListener:
                                     if self._results_muted:
                                         continue
                                 self.on_text(cmd)
-                    except Exception:
+                    except Exception as exc:
+                        log_diagnostic("voice", "recognition step failed", exc=exc)
                         continue
         finally:
             self._rec = None
             self._running.clear()
-
