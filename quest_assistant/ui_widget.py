@@ -8,15 +8,25 @@ import sys
 import threading
 import time
 import urllib.parse
-import webbrowser
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from quest_assistant.compose.models import ComposeRequest
 from quest_assistant.db import QuestDB, Task
 from quest_assistant.diagnostics import log_diagnostic
+from quest_assistant.core.session import SessionContext
+from quest_assistant.core.types import RouteKind, ToolCall
+from quest_assistant.events import AssistantEvent, EventBus, EventMonitorService
+from quest_assistant.intent import tools as intent_tools
+from quest_assistant.planner.models import ResearchPlan
+from quest_assistant.permissions import PermissionSession
+from quest_assistant.intent.router import IntentRouter
 from quest_assistant.local_llm import LLMAction, LLMResult, LocalLLMInterpreter
+from quest_assistant.memory import MemoryStore, try_ingest_rememberance
+from quest_assistant.memory.detect import looks_like_memory_panel_intent, resolve_memory_intent
+from quest_assistant.monitor.logger import log_intent, log_voice
 from quest_assistant.parser import (
     extract_add_titles,
     extract_delete_quest_number,
@@ -37,18 +47,38 @@ from quest_assistant.parser import (
     parse_action,
     parse_quest_number,
     parse_fx_enabled,
+    parse_background_sleep_intent,
     parse_hide_intent,
     parse_listen_off_intent,
     looks_like_listen_off,
     parse_open_browser_intent,
+    parse_open_target,
+    parse_download_search_query,
     parse_quit_intent,
+    parse_show_intent,
     parse_web_search_query,
     resolve_fx_enabled,
     split_into_items,
 )
+from quest_assistant.system.launcher import (
+    build_search_url,
+    canonical_open_target,
+    launch_app,
+    open_in_browser,
+    open_url_or_site,
+    resolve_browser_destination,
+    resolve_site_url,
+)
 from quest_assistant.sound_effects import SoundEffects
 from quest_assistant.speaker import Speaker
-from quest_assistant.voice_listener import VoiceListener
+from quest_assistant.ui.action_host import QuestActionHost
+from quest_assistant.ui.memory_panel import MemorySidePanel
+from quest_assistant.ui.permission_dialog import PermissionConfirmDialog
+from quest_assistant.voice.listener import (
+    VoiceListener,
+    _BACKGROUND_COMMAND_WINDOW_S,
+    _DEFAULT_COMMAND_WINDOW_S,
+)
 
 
 def _hide_widget_from_taskbar(widget: QtWidgets.QWidget) -> None:
@@ -347,7 +377,8 @@ class PrivacyListenButton(QtWidgets.QWidget):
 
 class AIFXBackground(QtWidgets.QFrame):
     _MAX_SIGNALS = 3
-    _SPAWN_CHANCE = 0.07
+    _SPAWN_CHANCE = 0.044  # tuned for ~20 FPS
+    _SIGNAL_SPEED = (0.0125, 0.0238)
     _PALETTE = (
         (34, 211, 238),
         (56, 189, 248),
@@ -481,7 +512,7 @@ class AIFXBackground(QtWidgets.QFrame):
 
         return {
             "points": points,
-            "speed": self._rng.uniform(0.020, 0.038),
+            "speed": self._rng.uniform(*self._SIGNAL_SPEED),
             "progress": -self._rng.uniform(0.04, 0.14),
             "length": self._rng.uniform(0.038, 0.072),
             "rgb": self._rng.choice(self._PALETTE),
@@ -587,10 +618,30 @@ class QuestWidget(QtWidgets.QWidget):
     _ECHO_GUARD_S = 4.5
     _VOICE_QUEUE_MAX = 6
     _LLM_PENDING_MAX = 2
-    _VISUAL_TIMER_MS = 80  # ~12 FPS — smooth but lighter on the UI thread
+    _VISUAL_FPS = 20
+    _VISUAL_TIMER_MS = 1000 // _VISUAL_FPS
+    _VISUAL_PHASE_STEP = 0.085 * (_VISUAL_TIMER_MS / 80)  # same glow speed as old ~12 FPS
     _COMPACT_LIST_THRESHOLD = 12
+    _BASE_CARD_WIDTH = 380
+    _WINDOW_CHROME_W = 24
+    _MEMORY_TAB_PROTRUSION = 36
+    _MEMORY_TAB_WIDTH = 36
+    _MEMORY_TAB_HEIGHT = 96
+    _MEMORY_TAB_OVERLAP = 5
     _LLM_CONTROL_KINDS = frozenset(
-        {"show", "hide", "listen_off", "add_done", "quit", "set_fx", "open_browser", "web_search"}
+        {
+            "show",
+            "hide",
+            "listen_off",
+            "add_done",
+            "quit",
+            "set_fx",
+            "open_browser",
+            "open_app",
+            "open_url",
+            "web_search",
+            "download_search",
+        }
     )
 
     _VOICE_GRACE_AFTER_SPEECH_S = 1.4
@@ -621,11 +672,19 @@ class QuestWidget(QtWidgets.QWidget):
 
     # Delivered from background worker threads -> queued onto the UI thread.
     _llm_result_ready = QtCore.Signal(int, str, str, object)
+    _planner_result_ready = QtCore.Signal(int, object, object)
+    _compose_result_ready = QtCore.Signal(int, object, object)
+    _vision_result_ready = QtCore.Signal(int, str)
     _refresh_data_ready = QtCore.Signal(int, object)
 
     def __init__(self, db: QuestDB) -> None:
         super().__init__()
         self.db = db
+        self.memory = MemoryStore(db.path)
+        self._permission_session = PermissionSession()
+        self.event_bus = EventBus()
+        self._event_service = EventMonitorService(self.event_bus)
+        self.event_bus.event_posted.connect(self._on_assistant_event)
         self.state = UIState()
         self._pending_voice_add = False
         self._pending_voice_add_until = 0.0
@@ -643,6 +702,13 @@ class QuestWidget(QtWidgets.QWidget):
         self._last_core_alpha = -1
         self._voice_grace_until = 0.0
         self._llm_busy = False
+        self._planner_busy = False
+        self._compose_busy = False
+        self._vision_busy = False
+        self._planner_seq = 0
+        self._compose_seq = 0
+        self._vision_seq = 0
+        self._events_started = False
         self._llm_seq = 0
         self._refresh_pending = False
         self._refresh_dirty = False
@@ -658,6 +724,9 @@ class QuestWidget(QtWidgets.QWidget):
         self._pending_llm_requests: list[tuple[str, str]] = []
         self._llm_active_seq = 0
         self._llm_result_ready.connect(self._on_llm_result)
+        self._planner_result_ready.connect(self._on_planner_result)
+        self._compose_result_ready.connect(self._on_compose_result)
+        self._vision_result_ready.connect(self._on_vision_result)
         self._refresh_data_ready.connect(self._on_refresh_data_ready)
 
         self.setWindowTitle("Assistance")
@@ -672,6 +741,9 @@ class QuestWidget(QtWidgets.QWidget):
         self._visual_phase = 0.0
 
         self.brain = LocalLLMInterpreter()
+        self._router = IntentRouter()
+        self._action_host = QuestActionHost(self)
+        self._last_apply_source = "voice"
         self.sfx = SoundEffects()
         self.speaker = Speaker(on_speak_state=self._on_speaker_state)
         self.speaker.preload(
@@ -691,7 +763,7 @@ class QuestWidget(QtWidgets.QWidget):
             on_text=self._on_voice_text,
             on_error=self._on_voice_error,
             wake_word="jarvis",
-            command_window_s=18.0,
+            command_window_s=30.0,
         )
         self.privacy_button = PrivacyListenButton(
             on_enable=lambda: self.enable_listening(announce=True),
@@ -707,7 +779,7 @@ class QuestWidget(QtWidgets.QWidget):
         self._visual_timer = QtCore.QTimer(self)
         self._visual_timer.timeout.connect(self._animate_visuals)
         self._visual_timer.setInterval(self._VISUAL_TIMER_MS)
-        self._visual_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
+        self._visual_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
 
         # Always listening in the background (wake word only while hidden).
         self.enable_listening(announce=False)
@@ -715,8 +787,9 @@ class QuestWidget(QtWidgets.QWidget):
         self._sync_privacy_button()
 
     def _build_ui(self) -> None:
-        outer = QtWidgets.QVBoxLayout(self)
+        outer = QtWidgets.QHBoxLayout(self)
         outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(0)
 
         self.card = QtWidgets.QFrame()
         self.card.setObjectName("card")
@@ -733,7 +806,14 @@ class QuestWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(content)
         layout.setContentsMargins(14, 14, 14, 14)
         stack.addWidget(content)
-        outer.addWidget(self.card)
+        outer.addWidget(self.card, 1)
+
+        self.memory_panel = MemorySidePanel(
+            lambda: self.memory,
+            on_open_changed=self._on_memory_panel_open_changed,
+            parent=self,
+        )
+        outer.addWidget(self.memory_panel)
 
         header = QtWidgets.QHBoxLayout()
         layout.addLayout(header)
@@ -813,8 +893,99 @@ class QuestWidget(QtWidgets.QWidget):
         self.footer.setStyleSheet("color: rgba(255,255,255,140); margin-top: 6px;")
         layout.addWidget(self.footer)
 
-        self.resize(380, 520)
+        self.memory_tab = QtWidgets.QPushButton("M\nE\nM\nO\nR\nY", parent=self)
+        self.memory_tab.setObjectName("memoryTab")
+        self.memory_tab.setCheckable(True)
+        self.memory_tab.setToolTip("Show what Jarvis remembers locally")
+        self.memory_tab.setFixedSize(self._MEMORY_TAB_WIDTH, self._MEMORY_TAB_HEIGHT)
+        tab_font = self.memory_tab.font()
+        tab_font.setBold(True)
+        tab_font.setWeight(QtGui.QFont.Weight.Bold)
+        tab_font.setPointSize(11)
+        self.memory_tab.setFont(tab_font)
+        self.memory_tab.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.memory_tab.clicked.connect(self._on_memory_button_clicked)
+        self.memory_tab.lower()
+        self._apply_memory_tab_style()
+
+        self._sync_window_width_for_memory(open=False, animate=False)
         self._apply_visual_core_style(0.0)
+        self._position_memory_tab()
+
+    def _position_memory_tab(self) -> None:
+        if not hasattr(self, "memory_tab") or not hasattr(self, "card"):
+            return
+        card_rect = self.card.geometry()
+        tab_w = self.memory_tab.width()
+        tab_h = self.memory_tab.height()
+        # Sit slightly under the card edge; letters are left-aligned in the tab.
+        x = card_rect.right() - self._MEMORY_TAB_OVERLAP
+        y = card_rect.top() + 36
+        max_y = card_rect.bottom() - tab_h - 12
+        if y > max_y:
+            y = max(card_rect.top() + 12, max_y)
+        self.memory_tab.move(x, y)
+        self.memory_tab.lower()
+        self.card.raise_()
+        if hasattr(self, "memory_panel"):
+            self.memory_panel.raise_()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._position_memory_tab()
+
+    def _on_memory_button_clicked(self) -> None:
+        if self.memory_panel.is_open:
+            self.hide_memory_panel()
+        else:
+            self.show_memory_panel(announce=False)
+
+    def _on_memory_panel_open_changed(self, open: bool) -> None:
+        self.memory_tab.setChecked(open)
+        self._apply_widget_style()
+        self._apply_memory_tab_style()
+        self._sync_window_width_for_memory(open=open, animate=True)
+        self._position_memory_tab()
+        if not open:
+            self._set_footer_default()
+
+    def _sync_window_width_for_memory(self, *, open: bool, animate: bool) -> None:
+        extra = MemorySidePanel.OPEN_WIDTH if open else 0
+        tab_extra = self._MEMORY_TAB_PROTRUSION
+        target_w = self._BASE_CARD_WIDTH + self._WINDOW_CHROME_W + extra + tab_extra
+        target_h = self.height() if self.height() > 100 else 520
+        if not animate:
+            self.resize(target_w, target_h)
+            return
+        anim = QtCore.QPropertyAnimation(self, b"size", self)
+        anim.setDuration(240)
+        anim.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+        anim.setStartValue(self.size())
+        anim.setEndValue(QtCore.QSize(target_w, target_h))
+        anim.start(QtCore.QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def show_memory_panel(self, *, announce: bool = False) -> None:
+        self.memory_panel.set_open(True)
+        if announce:
+            self._jarvis_say("Here is what I remember, sir.")
+        self.footer.setText("Memory panel open — prefs, facts, and recent activity.")
+
+    def hide_memory_panel(self, *, announce: bool = False) -> None:
+        was_open = self.memory_panel.is_open or self.memory_panel.maximumWidth() > 8
+        self.memory_panel.set_open(False)
+        self._sync_window_width_for_memory(open=False, animate=True)
+        self._position_memory_tab()
+        self.memory_tab.setChecked(False)
+        self._apply_memory_tab_style()
+        self._set_footer_default()
+        if announce:
+            self._jarvis_say(
+                "Memory closed, sir." if was_open else "Memory is already closed, sir."
+            )
+
+    def _refresh_memory_panel_if_open(self) -> None:
+        if self.memory_panel.is_open:
+            self.memory_panel.refresh()
 
     def _tick(self) -> None:
         self._expire_pending_add_if_needed()
@@ -937,7 +1108,7 @@ class QuestWidget(QtWidgets.QWidget):
             self._visual_timer.stop()
             return
         try:
-            self._visual_phase = (self._visual_phase + 0.085) % (math.pi * 2)
+            self._visual_phase = (self._visual_phase + self._VISUAL_PHASE_STEP) % (math.pi * 2)
             self.fx_background.set_phase(self._visual_phase)
         except Exception:
             self._visual_timer.stop()
@@ -968,7 +1139,7 @@ class QuestWidget(QtWidgets.QWidget):
             QFrame#card {{
               background: {card_bg};
               border: 1px solid {card_border};
-              border-radius: 14px;
+              {self._card_radius_css()};
             }}
             QLabel, QPushButton, QLineEdit, QListWidget {{
               color: #f3f4f6;
@@ -995,6 +1166,63 @@ class QuestWidget(QtWidgets.QWidget):
             }}
             """
         )
+        self._apply_memory_tab_style()
+
+    def _apply_memory_tab_style(self) -> None:
+        if not hasattr(self, "memory_tab"):
+            return
+        # One look for every state — opening the panel must not change colors or weight.
+        self.memory_tab.setStyleSheet(
+            """
+            QPushButton#memoryTab {
+              background: rgba(0, 0, 0, 252);
+              color: #ffffff;
+              border: 1px solid rgba(255, 255, 255, 55);
+              border-left: 0px;
+              border-top-right-radius: 9px;
+              border-bottom-right-radius: 9px;
+              border-top-left-radius: 0px;
+              border-bottom-left-radius: 0px;
+              font-size: 11px;
+              font-weight: 800;
+              padding: 6px 14px 6px 3px;
+              line-height: 1.08;
+            }
+            QPushButton#memoryTab:checked {
+              background: rgba(0, 0, 0, 252);
+              color: #ffffff;
+              font-weight: 800;
+              border-color: rgba(125, 211, 252, 150);
+            }
+            QPushButton#memoryTab:hover {
+              background: rgba(0, 0, 0, 252);
+              color: #ffffff;
+              font-weight: 800;
+              border-color: rgba(125, 211, 252, 180);
+            }
+            QPushButton#memoryTab:pressed {
+              background: rgba(0, 0, 0, 252);
+              color: #ffffff;
+              font-weight: 800;
+            }
+            """
+        )
+        tab_font = self.memory_tab.font()
+        tab_font.setBold(True)
+        tab_font.setWeight(QtGui.QFont.Weight.Bold)
+        tab_font.setPointSize(11)
+        self.memory_tab.setFont(tab_font)
+
+    def _card_radius_css(self) -> str:
+        memory_open = getattr(self, "memory_panel", None) is not None and self.memory_panel.is_open
+        if memory_open:
+            return (
+                "border-top-left-radius: 14px;"
+                " border-bottom-left-radius: 14px;"
+                " border-top-right-radius: 0px;"
+                " border-bottom-right-radius: 0px;"
+            )
+        return "border-radius: 14px;"
 
     def _apply_visual_core_style(self, pulse: float) -> None:
         if getattr(self.state, "visuals_enabled", False):
@@ -1133,84 +1361,165 @@ class QuestWidget(QtWidgets.QWidget):
     def _apply_text(self, text: str, source: str) -> None:
         try:
             self._apply_text_impl(text, source=source)
+            if source == "voice" and self._spoke_this_turn:
+                self.voice.touch_command_window()
         except Exception as exc:
             log_diagnostic("ui", f"apply_text failed ({source}): {text!r}", exc=exc)
             self.footer.setText("Something went wrong. See ~/.quest_assistant/diagnostic.log")
 
+    def _memory_context(self) -> str:
+        try:
+            return self.memory.format_for_llm(max_chars=900)
+        except Exception as exc:
+            log_diagnostic("memory", "format_for_llm failed", exc=exc)
+            return ""
+
+    def request_tool_confirmation(self, calls: list[ToolCall]) -> bool:
+        """UI-thread confirmation for medium/high risk tools."""
+        dlg = PermissionConfirmDialog(self, calls)
+        return dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted
+
+    @QtCore.Slot(object)
+    def _on_assistant_event(self, event: object) -> None:
+        if not isinstance(event, AssistantEvent):
+            return
+        self.footer.setText(event.message[:200])
+        proactive_kinds = frozenset({"battery", "timer", "download"})
+        if event.speak and (
+            self.state.jarvis_awake or event.kind in proactive_kinds
+        ):
+            self._jarvis_say(event.message)
+        try:
+            self.memory.record_interaction(f"event:{event.kind} {event.message[:100]}")
+        except Exception:
+            pass
+
+    def _session_context(self, source: str) -> SessionContext:
+        return SessionContext(
+            source=source,
+            jarvis_awake=self.state.jarvis_awake,
+            listening_requested=self.state.listening_requested,
+            pending_add=self._pending_voice_add,
+            pending_delete=self._pending_voice_delete,
+            open_quests=self._open_quests_for_llm(),
+            fx_visually_on=self._fx_is_visually_on(),
+            may_use_ollama=self.brain.may_use_ollama,
+            llm_enabled=self.brain.is_enabled,
+            last_command_text=self._last_command_text,
+            voice_filler_words=self._VOICE_FILLER_WORDS,
+        )
+
     def _apply_text_impl(self, text: str, source: str) -> None:
         self._spoke_this_turn = False
         self._last_command_text = text
+        self._last_apply_source = source
         self._expire_pending_add_if_needed()
         self._expire_pending_delete_if_needed()
         if self._pending_voice_add and self._should_cancel_pending_add(text):
             self._set_pending_add(False)
             self._set_footer_default()
 
-        if self._pending_voice_delete and self._try_apply_pending_delete(text):
+        if try_ingest_rememberance(self.memory, text):
+            self._jarvis_say("Noted, sir.")
+            self.memory.record_interaction(f"remembered: {text[:120]}")
+            self._refresh_memory_panel_if_open()
             self._complete_instant_command()
             return
 
-        # Mic/privacy off — instant, before anything else (no LLM wait).
-        if looks_like_listen_off(text):
-            if self._apply_nonquest_llm_action(LLMAction(kind="listen_off")):
+        try:
+            self.memory.record_interaction(text[:200])
+        except Exception:
+            pass
+
+        log_intent(f"route_start source={source} text={text[:80]!r}")
+        if self._try_memory_command(text, source):
+            return
+        if parse_show_intent(text):
+            self._action_host.execute(
+                [intent_tools.tool(intent_tools.TOOL_SHOW)],
+                route_path="show",
+            )
+            self._complete_instant_command()
+            return
+        if self._try_compose_command(text, source):
+            return
+
+        decision = self._router.route(text, self._session_context(source))
+
+        if decision.kind == RouteKind.EXECUTE and decision.tool_calls:
+            self._action_host.execute(decision.tool_calls, route_path=decision.route_path)
+            if decision.instant:
                 self._complete_instant_command()
+            else:
+                self.refresh()
+            return
+
+        if decision.kind == RouteKind.PLAN and decision.research_plan is not None:
+            self._planner_seq += 1
+            if self._dispatch_planner(decision.research_plan, self._planner_seq):
                 return
-
-        # Deterministic controls (FX, show, hide, etc.) before the LLM — avoids misheard deletes.
-        if self._try_apply_fx_command(text):
-            self._complete_instant_command()
-            return
-        if self._try_apply_parser_control_action(text):
-            self._complete_instant_command()
-            return
-        if self._try_apply_casual_intent(text):
-            self._complete_instant_command()
-            return
-
-        if looks_like_delete_intent(text) and self._try_apply_quest_command(text, source):
-            self._complete_instant_command()
-            return
-
-        if self._try_apply_quest_command(text, source):
-            self._complete_instant_command()
-            return
-
-        # Add / collect quests locally — never send "add task" or the next title to the LLM first.
-        if source == "voice" and self.state.jarvis_awake and (
-            self._pending_voice_add or has_add_intent(text)
-        ):
-            if self._apply_parser_actions(text, source):
-                self._complete_instant_command()
-                return
-
-        # When Jarvis is awake, prefer natural-language understanding for voice.
-        if (
-            source == "voice"
-            and self.state.jarvis_awake
-            and self.brain.may_use_ollama
-            and self._should_dispatch_llm_awake(text)
-        ):
-            self._llm_seq += 1
-            if self._dispatch_llm(text, source, self._llm_seq):
-                return
-
-        if self._apply_parser_actions(text, source):
-            self._complete_instant_command()
-            return
-
-        # Natural-language understanding via the local model, OFF the UI thread.
-        if self.brain.may_use_ollama and self._should_dispatch_llm(text):
-            self._llm_seq += 1
-            if self._dispatch_llm(text, source, self._llm_seq):
-                return
-
-        if source == "typed" and not looks_like_typed_quest(text):
-            self.footer.setText('Type a quest title, or say "add …" for voice-style commands.')
-            return
-
-        if self._try_voice_conversation_fallback(text, source):
             self.refresh()
             return
+
+        if decision.kind == RouteKind.COMPOSE and decision.compose_request is not None:
+            self._compose_seq += 1
+            if self._dispatch_compose(decision.compose_request, self._compose_seq):
+                return
+            if source == "voice" and not self._spoke_this_turn:
+                self._jarvis_say("I'm still working on the last draft, sir.")
+            self.refresh()
+            return
+
+        if decision.kind == RouteKind.VISION:
+            self._vision_seq += 1
+            prompt = decision.vision_prompt or text
+            if self._dispatch_vision(prompt, self._vision_seq):
+                return
+            self.refresh()
+            return
+
+        if decision.kind == RouteKind.LLM:
+            if self._try_compose_command(text, source):
+                return
+            self._llm_seq += 1
+            if self._dispatch_llm(text, source, self._llm_seq):
+                return
+            if self._try_apply_parser_control_action(text):
+                self._complete_instant_command()
+                return
+            self.refresh()
+            return
+
+        if decision.kind == RouteKind.TYPED_HINT and decision.footer:
+            self.footer.setText(decision.footer)
+            if source == "voice" and not self._spoke_this_turn:
+                if "Ollama" in (decision.footer or ""):
+                    self._jarvis_say("I need Ollama running to draft that for you, sir.")
+                else:
+                    self._jarvis_say(decision.footer)
+            return
+
+        if decision.kind == RouteKind.CONVERSATION:
+            if parse_show_intent(text):
+                self._action_host.execute(
+                    [intent_tools.tool(intent_tools.TOOL_SHOW)],
+                    route_path="show",
+                )
+                self._complete_instant_command()
+                return
+            if self._try_voice_conversation_fallback(text, source):
+                self.refresh()
+                return
+
+        if decision.kind == RouteKind.NOOP:
+            if self._try_apply_parser_control_action(text):
+                self._complete_instant_command()
+                return
+            if source == "voice" and not self._spoke_this_turn:
+                if not self.isVisible() and self.state.listening_requested:
+                    self._jarvis_say('Start with "Jarvis", then say your command, sir.')
+                else:
+                    self._jarvis_say("Sorry sir, I didn't catch that.")
 
         self.refresh()
 
@@ -1403,7 +1712,7 @@ class QuestWidget(QtWidgets.QWidget):
             return False
         if parse_hide_intent(text) or parse_quit_intent(text) or looks_like_listen_off(text):
             return False
-        if parse_open_browser_intent(text) or parse_web_search_query(text):
+        if parse_open_browser_intent(text) or parse_open_target(text) or parse_download_search_query(text) or parse_web_search_query(text):
             return False
         if has_add_intent(text):
             return False
@@ -1419,7 +1728,10 @@ class QuestWidget(QtWidgets.QWidget):
             "edit",
             "add",
             "open_browser",
+            "open_app",
+            "open_url",
             "web_search",
+            "download_search",
         }:
             return False
         return True
@@ -1439,6 +1751,8 @@ class QuestWidget(QtWidgets.QWidget):
         dispatch_seq = seq
         brain = self.brain
         db = self.db
+        memory = self.memory
+        memory_ctx = self._memory_context()
 
         def worker() -> None:
             result = None
@@ -1448,29 +1762,56 @@ class QuestWidget(QtWidgets.QWidget):
                     for index, task in enumerate(db.list_tasks(status="open"), start=1)
                 ]
                 fx = resolve_fx_enabled(text)
-                if fx is not None:
+                if parse_show_intent(text):
                     result = LLMResult(
-                        actions=[LLMAction(kind="set_fx", value="on" if fx else "off")],
+                        actions=[LLMAction(kind="show")],
                         elapsed_s=0.0,
                         model=brain.model,
                     )
-                elif looks_like_delete_intent(text) or has_delete_intent(text):
-                    result = None
-                elif source == "voice" and jarvis_awake:
-                    result = brain.interpret_voice(
-                        text,
-                        pending_add=pending_add,
-                        jarvis_awake=jarvis_awake,
-                        open_quests=open_quests,
-                    )
                 else:
-                    result = brain.interpret(
+                    memory_intent = resolve_memory_intent(
                         text,
-                        pending_add=pending_add,
-                        jarvis_awake=jarvis_awake,
-                        open_quests=open_quests,
-                        source=source,
+                        memory_panel_open=self._memory_panel_visible(),
                     )
+                    if memory_intent:
+                        result = LLMResult(
+                            actions=[
+                                LLMAction(
+                                    kind=(
+                                        "hide_memory"
+                                        if memory_intent == "hide"
+                                        else "show_memory"
+                                    )
+                                )
+                            ],
+                            elapsed_s=0.0,
+                            model=brain.model,
+                        )
+                    elif fx is not None:
+                        result = LLMResult(
+                            actions=[LLMAction(kind="set_fx", value="on" if fx else "off")],
+                            elapsed_s=0.0,
+                            model=brain.model,
+                        )
+                    elif looks_like_delete_intent(text) or has_delete_intent(text):
+                        result = None
+                    elif source == "voice" and jarvis_awake:
+                        result = brain.interpret_voice(
+                            text,
+                            pending_add=pending_add,
+                            jarvis_awake=jarvis_awake,
+                            open_quests=open_quests,
+                            memory_context=memory_ctx or None,
+                        )
+                    else:
+                        result = brain.interpret(
+                            text,
+                            pending_add=pending_add,
+                            jarvis_awake=jarvis_awake,
+                            open_quests=open_quests,
+                            source=source,
+                            memory_context=memory_ctx or None,
+                        )
             except Exception as exc:
                 log_diagnostic("llm", "interpret worker failed", exc=exc)
                 result = None
@@ -1489,15 +1830,237 @@ class QuestWidget(QtWidgets.QWidget):
         self._sync_fx_timer()
         while self._pending_llm_requests:
             pending_text, pending_source = self._pending_llm_requests.pop(0)
-            should = (
-                self._should_dispatch_llm_awake(pending_text)
-                if pending_source == "voice" and self.state.jarvis_awake
-                else self._should_dispatch_llm(pending_text)
-            )
-            if self.brain.may_use_ollama and should:
+            ctx = self._session_context(pending_source)
+            decision = self._router.route(pending_text, ctx)
+            if self.brain.may_use_ollama and decision.kind == RouteKind.LLM:
                 self._llm_seq += 1
                 self._dispatch_llm(pending_text, pending_source, self._llm_seq)
                 return
+
+    def _dispatch_planner(self, plan: ResearchPlan, seq: int) -> bool:
+        if self._planner_busy:
+            return False
+        self._planner_busy = True
+        self.footer.setText("Researching, sir…")
+        self._pause_fx_for_llm()
+        self._action_host.execute(
+            [
+                intent_tools.tool(
+                    intent_tools.TOOL_WEB_SEARCH,
+                    query=plan.query,
+                )
+            ],
+            route_path="planner_search",
+        )
+        brain = self.brain
+        memory_ctx = self._memory_context()
+
+        def worker() -> None:
+            pair = None
+            try:
+                pair = brain.summarize_research(plan.query, memory_context=memory_ctx or None)
+            except Exception as exc:
+                log_diagnostic("planner", "summarize failed", exc=exc)
+            finally:
+                try:
+                    self._planner_result_ready.emit(seq, plan, pair)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, name="PlannerWorker", daemon=True).start()
+        return True
+
+    def _memory_panel_visible(self) -> bool:
+        return self.memory_panel.is_open or self.memory_panel.maximumWidth() > 8
+
+    def _try_memory_command(self, text: str, source: str) -> bool:
+        intent = resolve_memory_intent(
+            text,
+            memory_panel_open=self._memory_panel_visible(),
+        )
+        if intent is None:
+            return False
+        tool = (
+            intent_tools.TOOL_HIDE_MEMORY
+            if intent == "hide"
+            else intent_tools.TOOL_SHOW_MEMORY
+        )
+        self._action_host.execute([intent_tools.tool(tool)], route_path="memory")
+        self._complete_instant_command()
+        return True
+
+    def _try_compose_command(self, text: str, source: str) -> bool:
+        from quest_assistant.compose.detect import resolve_compose_request
+
+        compose = resolve_compose_request(text)
+        if compose is None:
+            return False
+        if self.brain.may_use_ollama:
+            self._compose_seq += 1
+            if self._dispatch_compose(compose, self._compose_seq):
+                return True
+            if source == "voice" and not self._spoke_this_turn:
+                self._jarvis_say("I'm still working on the last draft, sir.")
+            self.refresh()
+            return True
+        self.footer.setText("Drafting needs Ollama running locally. Start Ollama, then try again.")
+        if source == "voice" and not self._spoke_this_turn:
+            self._jarvis_say("I need Ollama running to draft that for you, sir.")
+        return True
+
+    def _dispatch_compose(self, request: ComposeRequest, seq: int) -> bool:
+        if self._compose_busy:
+            return False
+        self._compose_busy = True
+        dest_label = {"word": "Word", "outlook": "Outlook", "notepad": "Notepad"}.get(
+            request.destination, "Notepad"
+        )
+        self.footer.setText(f"Drafting your {dest_label} document, sir…")
+        if not self._spoke_this_turn:
+            self._jarvis_say(f"Drafting that in {dest_label} now, sir.")
+        self._pause_fx_for_llm()
+        brain = self.brain
+        memory_ctx = self._memory_context()
+
+        def worker() -> None:
+            result = None
+            try:
+                result = brain.compose_document(
+                    request.topic,
+                    destination=request.destination,
+                    memory_context=memory_ctx or None,
+                )
+            except Exception as exc:
+                log_diagnostic("compose", "draft failed", exc=exc)
+            finally:
+                try:
+                    self._compose_result_ready.emit(seq, request, result)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, name="ComposeWorker", daemon=True).start()
+        return True
+
+    @QtCore.Slot(int, object, object)
+    def _on_compose_result(self, seq: int, request: object, content: object) -> None:
+        try:
+            if seq != self._compose_seq or not isinstance(request, ComposeRequest):
+                return
+            if not content or not str(content).strip():
+                self._jarvis_say(
+                    "I couldn't draft that text, sir. Check that Ollama is running and try again."
+                )
+                return
+            from quest_assistant.system.compose import deliver_compose
+
+            ok, spoken = deliver_compose(request.destination, str(content).strip(), request.topic)
+            self._jarvis_say(spoken)
+            if ok:
+                try:
+                    self.memory.record_interaction(f"compose:{request.destination} {request.topic[:80]}")
+                except Exception:
+                    pass
+        except Exception as exc:
+            log_diagnostic("compose", "result handling failed", exc=exc)
+            self._jarvis_say("Something went wrong while preparing your draft, sir.")
+        finally:
+            self._compose_busy = False
+            self._resume_fx_for_llm()
+            self._set_footer_default()
+            self.refresh()
+
+    @QtCore.Slot(int, object, object)
+    def _on_planner_result(self, seq: int, plan: object, result: object) -> None:
+        try:
+            if seq != self._planner_seq or not isinstance(plan, ResearchPlan):
+                return
+            if result is None:
+                self._jarvis_say(
+                    "I opened a web search, sir, but I need the local model to summarize and add a quest."
+                )
+                return
+            summary, title = result
+            if plan.add_quest and title:
+                self._action_host.execute(
+                    [
+                        intent_tools.tool(
+                            intent_tools.TOOL_CREATE_TASK,
+                            titles=[title],
+                            source=self._last_apply_source,
+                        )
+                    ],
+                    route_path="planner_quest",
+                )
+            short = summary if len(summary) <= 220 else summary[:217] + "..."
+            if plan.add_quest and title:
+                self._jarvis_say(f"Sir, {short} I added the quest: {title}.")
+            else:
+                self._jarvis_say(f"Sir, {short}")
+            try:
+                self.memory.record_interaction(f"planner: {plan.query[:80]}")
+            except Exception:
+                pass
+        except Exception as exc:
+            log_diagnostic("planner", "result handling failed", exc=exc)
+        finally:
+            self._planner_busy = False
+            self._resume_fx_for_llm()
+            self._set_footer_default()
+            self.refresh()
+
+    def _dispatch_vision(self, prompt: str, seq: int) -> bool:
+        if self._vision_busy:
+            return False
+        from quest_assistant.vision.capture import capture_primary_screen
+        from quest_assistant.vision.describe import describe_screenshot
+        from quest_assistant.vision.detect import vision_enabled
+
+        if not vision_enabled():
+            self._jarvis_say(
+                "Screen vision is off. Set JARVIS_VISION=1 and pull a vision model in Ollama, sir."
+            )
+            return False
+        self._vision_busy = True
+        self.footer.setText("Looking at your screen…")
+        path = capture_primary_screen()
+        if path is None:
+            self._vision_busy = False
+            self._jarvis_say("I could not capture the screen, sir.")
+            return False
+
+        def worker() -> None:
+            reply = ""
+            try:
+                described = describe_screenshot(path, user_prompt=prompt)
+                reply = described or ""
+            except Exception as exc:
+                log_diagnostic("vision", "describe failed", exc=exc)
+            finally:
+                try:
+                    self._vision_result_ready.emit(seq, reply)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, name="VisionWorker", daemon=True).start()
+        return True
+
+    @QtCore.Slot(int, str)
+    def _on_vision_result(self, seq: int, reply: str) -> None:
+        try:
+            if seq != self._vision_seq:
+                return
+            if reply.strip():
+                self._jarvis_say(reply.strip()[:450])
+            else:
+                self._jarvis_say(
+                    "I could not describe the screen. Install a vision model in Ollama, for example llava, sir."
+                )
+        except Exception as exc:
+            log_diagnostic("vision", "result handling failed", exc=exc)
+        finally:
+            self._vision_busy = False
+            self._set_footer_default()
+            self.refresh()
 
     @QtCore.Slot(int, str, str, object)
     def _on_llm_result(self, seq: int, text: str, source: str, result: object) -> None:
@@ -1505,30 +2068,81 @@ class QuestWidget(QtWidgets.QWidget):
             if seq == self._llm_seq:
                 self._spoke_this_turn = False
                 self._last_command_text = text
-                if self._try_apply_fx_command(text):
+                self._last_apply_source = source
+                ctx = self._session_context(source)
+
+                from quest_assistant.intent import parser_route
+
+                fx_calls = parser_route.route_fx_voice(text, fx_visually_on=ctx.fx_visually_on)
+                if fx_calls:
+                    self._action_host.execute(fx_calls, route_path="llm_fx")
                     self._set_footer_default()
                     self.refresh()
                     return
-                if self._try_apply_pending_delete(text):
+
+                quest_calls = parser_route.route_quest_command(text)
+                if quest_calls:
+                    self._action_host.execute(quest_calls, route_path="llm_quest")
                     self._set_footer_default()
                     self.refresh()
                     return
-                if self._try_apply_quest_command(text, source):
+
+                if ctx.pending_add:
+                    add_calls = parser_route.route_parser_actions(text, ctx)
+                    if add_calls:
+                        self._action_host.execute(add_calls, route_path="llm_pending_add")
+                        self._set_footer_default()
+                        self.refresh()
+                        return
+
+                from quest_assistant.compose.detect import is_echo_reply, resolve_compose_request
+
+                mem_calls = parser_route.route_memory_controls(text)
+                if mem_calls:
+                    self._action_host.execute(mem_calls, route_path="llm_memory")
                     self._set_footer_default()
                     self.refresh()
                     return
-                if self._pending_voice_add and self._apply_parser_actions(text, source):
+
+                compose = resolve_compose_request(text)
+                if compose and self.brain.may_use_ollama:
+                    self._compose_seq += 1
+                    if self._dispatch_compose(compose, self._compose_seq):
+                        return
+
+                if result is not None:
+                    result_actions = getattr(result, "actions", None) or []
+                    actions = [a for a in result_actions if a.kind != "noop"]
+                    if actions and self._action_host.execute_llm_actions(
+                        actions, utterance=text, source=source
+                    ):
+                        self._set_footer_default()
+                        self.refresh()
+                        return
+                    replies = [a.value for a in result_actions if a.kind == "reply" and a.value]
+                    if replies and self.state.jarvis_awake and source == "voice":
+                        spoken = " ".join(replies[:2])
+                        if is_echo_reply(text, spoken):
+                            if compose and self.brain.may_use_ollama:
+                                self._compose_seq += 1
+                                if self._dispatch_compose(compose, self._compose_seq):
+                                    return
+                            self._jarvis_say(
+                                "I'll draft that for you once Ollama is ready, sir."
+                            )
+                            return
+                        self._jarvis_say(spoken)
+                        self._set_footer_default()
+                        self.refresh()
+                        return
+
+                parser_calls = parser_route.route_parser_actions(text, ctx)
+                if parser_calls:
+                    self._action_host.execute(parser_calls, route_path="llm_parser_fallback")
                     self._set_footer_default()
                     self.refresh()
                     return
-                if result is not None and self._apply_llm_result(text, source, result):
-                    self._set_footer_default()
-                    self.refresh()
-                    return
-                if self._apply_parser_actions(text, source):
-                    self._set_footer_default()
-                    self.refresh()
-                    return
+
                 if self._try_voice_conversation_fallback(text, source):
                     self._set_footer_default()
                     self.refresh()
@@ -1547,6 +2161,7 @@ class QuestWidget(QtWidgets.QWidget):
         """Parser handled the utterance immediately — clear any stale LLM wait state."""
         if self._llm_busy:
             self._llm_seq += 1
+        self._refresh_memory_panel_if_open()
         self._set_footer_default()
         self.refresh()
 
@@ -1579,12 +2194,35 @@ class QuestWidget(QtWidgets.QWidget):
             return self.db.find_best_open_by_title(title)
         return None
 
+    def _open_task_ids_for_batch_targets(
+        self,
+        *,
+        numbers: list[int],
+        titles: list[str],
+    ) -> set[int]:
+        """
+        Resolve 1-based open-task numbers and title needles against a single snapshot
+        so multi-delete/complete by number does not shift indices mid-batch.
+        """
+        open_tasks = self.db.list_tasks(status="open")
+        ids: set[int] = set()
+        for number in numbers:
+            if number is not None and 1 <= number <= len(open_tasks):
+                ids.add(open_tasks[number - 1].id)
+        for title in titles:
+            if not title:
+                continue
+            task = self.db.find_best_open_by_title(title)
+            if task is not None:
+                ids.add(task.id)
+        return ids
+
     def _complete_open_quest(
         self,
         *,
         title: Optional[str] = None,
         number: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         task = self._resolve_open_quest(title=title, number=number)
         if task:
             self.db.set_status(task.id, "done")
@@ -1593,20 +2231,22 @@ class QuestWidget(QtWidgets.QWidget):
                 self._jarvis_say(f"Task {number} completed: {task.title}.")
             else:
                 self._jarvis_say(f"Quest completed: {task.title}.")
+            self._finish_quest_mutation()
+            return True
+        self.sfx.play("error")
+        if number is not None:
+            self._jarvis_say(f"I could not find open task {number}, sir.")
         else:
-            self.sfx.play("error")
-            if number is not None:
-                self._jarvis_say(f"I could not find open task {number}, sir.")
-            else:
-                self._jarvis_say(f"I could not find an open quest matching {title}.")
+            self._jarvis_say(f"I could not find an open quest matching {title}.")
         self._finish_quest_mutation()
+        return False
 
     def _delete_open_quest(
         self,
         *,
         title: Optional[str] = None,
         number: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         task: Optional[Task] = None
         if number is not None:
             task = self.db.get_open_task_by_number(number)
@@ -1620,13 +2260,15 @@ class QuestWidget(QtWidgets.QWidget):
                 self._jarvis_say(f"Task {number} deleted: {task.title}.")
             else:
                 self._jarvis_say(f"Quest deleted: {task.title}.")
+            self._finish_quest_mutation()
+            return True
+        self.sfx.play("error")
+        if number is not None:
+            self._jarvis_say(f"I could not find open task {number}, sir.")
         else:
-            self.sfx.play("error")
-            if number is not None:
-                self._jarvis_say(f"I could not find open task {number}, sir.")
-            else:
-                self._jarvis_say(f"I could not find an open quest matching {title}.")
+            self._jarvis_say(f"I could not find an open quest matching {title}.")
         self._finish_quest_mutation()
+        return False
 
     def _edit_open_quest(
         self,
@@ -1674,10 +2316,25 @@ class QuestWidget(QtWidgets.QWidget):
             return self._apply_nonquest_llm_action(LLMAction(kind="listen_off"))
 
         if parse_hide_intent(text):
+            if self._memory_panel_visible():
+                mem = resolve_memory_intent(text, memory_panel_open=True)
+                if mem == "hide":
+                    return self._try_memory_command(text, self._last_apply_source or "voice")
             return self._apply_nonquest_llm_action(LLMAction(kind="hide"))
 
         if parse_quit_intent(text):
             return self._apply_nonquest_llm_action(LLMAction(kind="quit"))
+
+        open_target = parse_open_target(text)
+        if open_target is not None:
+            kind, target = open_target
+            if kind == "url":
+                return self._apply_nonquest_llm_action(LLMAction(kind="open_url", value=target))
+            return self._apply_nonquest_llm_action(LLMAction(kind="open_app", value=target))
+
+        download_query = parse_download_search_query(text)
+        if download_query:
+            return self._apply_nonquest_llm_action(LLMAction(kind="download_search", value=download_query))
 
         if parse_open_browser_intent(text):
             return self._apply_nonquest_llm_action(LLMAction(kind="open_browser"))
@@ -1694,13 +2351,22 @@ class QuestWidget(QtWidgets.QWidget):
             "add_done",
             "quit",
             "open_browser",
+            "open_app",
+            "open_url",
             "web_search",
+            "download_search",
         }:
             return False
         if action.kind == "web_search":
             return self._apply_nonquest_llm_action(LLMAction(kind="web_search", value=action.value))
+        if action.kind == "download_search":
+            return self._apply_nonquest_llm_action(LLMAction(kind="download_search", value=action.value))
         if action.kind == "open_browser":
             return self._apply_nonquest_llm_action(LLMAction(kind="open_browser"))
+        if action.kind == "open_app":
+            return self._apply_nonquest_llm_action(LLMAction(kind="open_app", value=action.value))
+        if action.kind == "open_url":
+            return self._apply_nonquest_llm_action(LLMAction(kind="open_url", value=action.value))
         return self._apply_nonquest_llm_action(LLMAction(kind=action.kind, title=action.title))
 
     def _open_quests_for_llm(self) -> list[dict[str, object]]:
@@ -1742,6 +2408,8 @@ class QuestWidget(QtWidgets.QWidget):
             return True
 
         if looks_like_chat(text):
+            if self._try_compose_command(text, source):
+                return True
             if self.brain.may_use_ollama:
                 self._llm_seq += 1
                 if self._dispatch_llm(text, source, self._llm_seq):
@@ -1776,7 +2444,14 @@ class QuestWidget(QtWidgets.QWidget):
             if self.state.jarvis_awake and source == "voice":
                 replies = [a.value for a in result_actions if a.kind == "reply" and a.value]
                 if replies:
-                    self._jarvis_say(" ".join(replies[:2]))
+                    from quest_assistant.compose.detect import is_echo_reply
+
+                    spoken = " ".join(replies[:2])
+                    if is_echo_reply(text, spoken):
+                        if self._try_compose_command(text, source):
+                            return True
+                    else:
+                        self._jarvis_say(spoken)
                     return True
             return False
 
@@ -1796,6 +2471,10 @@ class QuestWidget(QtWidgets.QWidget):
         add_titles: list[str] = []
         completed = 0
         deleted = 0
+        pending_complete_numbers: list[int] = []
+        pending_complete_titles: list[str] = []
+        pending_delete_numbers: list[int] = []
+        pending_delete_titles: list[str] = []
         replies: list[str] = []
         handled = False
         control_used = False
@@ -1822,11 +2501,8 @@ class QuestWidget(QtWidgets.QWidget):
                 if delete_like:
                     number = extract_delete_quest_number(text)
                     if number is not None:
-                        task = self.db.get_open_task_by_number(number)
-                        if task:
-                            self.db.delete_task(task.id)
-                            deleted += 1
-                            handled = True
+                        pending_delete_numbers.append(number)
+                        handled = True
                     continue
                 if action.title:
                     title = normalize_quest_title(action.title)
@@ -1843,12 +2519,9 @@ class QuestWidget(QtWidgets.QWidget):
                 title = action.title
                 number = self._quest_number_from_llm_title(title or "")
                 if number is not None:
-                    title = None
-                if number is not None or title:
-                    task = self._resolve_open_quest(title=title, number=number)
-                    if task:
-                        self.db.set_status(task.id, "done")
-                        completed += 1
+                    pending_complete_numbers.append(number)
+                elif title:
+                    pending_complete_titles.append(title)
                 continue
 
             if action.kind == "delete":
@@ -1861,27 +2534,20 @@ class QuestWidget(QtWidgets.QWidget):
                         re.IGNORECASE,
                     )
                 )
-                if deleted >= 1 and not allow_multi:
+                if (pending_delete_numbers or pending_delete_titles) and not allow_multi:
                     continue
                 number = self._quest_number_from_llm_title(action.title or "")
-                title = None if number is not None else action.title
                 if number is not None:
-                    task = self.db.get_open_task_by_number(number)
-                    if task:
-                        self.db.delete_task(task.id)
-                        deleted += 1
-                elif title:
-                    task = self.db.find_best_open_by_title(title)
-                    if task:
-                        self.db.delete_task(task.id)
-                        deleted += 1
+                    pending_delete_numbers.append(number)
+                elif action.title:
+                    pending_delete_titles.append(action.title)
                 continue
 
             if action.kind == "edit":
                 if not action.value:
                     continue
                 if not has_edit_intent(text) and not re.search(
-                    r"\b(?:edit|rename|change|fix|correct|update|call)\b",
+                    r"\b(?:edit|rename|change|fix|correct|update)\b",
                     text,
                     re.IGNORECASE,
                 ):
@@ -1906,6 +2572,28 @@ class QuestWidget(QtWidgets.QWidget):
             if action.kind == "reply" and action.value:
                 replies.append(action.value)
                 continue
+
+        if pending_complete_numbers or pending_complete_titles:
+            complete_ids = self._open_task_ids_for_batch_targets(
+                numbers=pending_complete_numbers,
+                titles=pending_complete_titles,
+            )
+            for task_id in complete_ids:
+                self.db.set_status(task_id, "done")
+            if complete_ids:
+                completed = len(complete_ids)
+                handled = True
+
+        if pending_delete_numbers or pending_delete_titles:
+            delete_ids = self._open_task_ids_for_batch_targets(
+                numbers=pending_delete_numbers,
+                titles=pending_delete_titles,
+            )
+            for task_id in delete_ids:
+                self.db.delete_task(task_id)
+            if delete_ids:
+                deleted = len(delete_ids)
+                handled = True
 
         added_count = 0
         for title in add_titles:
@@ -1934,8 +2622,19 @@ class QuestWidget(QtWidgets.QWidget):
             handled = True
             self._jarvis_say("Of course. Tell me the quest.")
         elif replies:
+            from quest_assistant.compose.detect import is_echo_reply, resolve_compose_request
+
+            spoken = " ".join(replies[:2])
+            if is_echo_reply(text, spoken):
+                compose = resolve_compose_request(text)
+                if compose and self.brain.may_use_ollama:
+                    self._compose_seq += 1
+                    if self._dispatch_compose(compose, self._compose_seq):
+                        return True
+                self._jarvis_say("I'll draft that for you once Ollama is ready, sir.")
+                return True
             handled = True
-            self._jarvis_say(" ".join(replies[:2]))
+            self._jarvis_say(spoken)
 
         if not handled:
             return False
@@ -1949,16 +2648,20 @@ class QuestWidget(QtWidgets.QWidget):
             self._jarvis_say("Yes, sir.")
             self.state.jarvis_awake = True
             self._sync_voice_gate()
-            if self.isVisible() or self._show_pending:
-                return True
-            if not self._should_accept_control_action("show"):
-                return True
-            self._show_pending = True
-            self._after_speech_begins(self._finish_show, delay_ms=700)
             self._set_pending_add(False)
+            if not self.isVisible():
+                self._show_pending = False
+                self._finish_show()
             return True
 
         if action.kind == "hide":
+            mem = resolve_memory_intent(
+                self._last_command_text or "",
+                memory_panel_open=self._memory_panel_visible(),
+            )
+            if mem == "hide":
+                self.hide_memory_panel(announce=True)
+                return True
             self._jarvis_say("Going quiet, sir.")
             self._pause_fx_render()
             if not self.isVisible() or self._hide_pending:
@@ -1966,7 +2669,11 @@ class QuestWidget(QtWidgets.QWidget):
             if not self._should_accept_control_action("hide"):
                 return True
             self._hide_pending = True
-            self._after_speech_begins(self._finish_hide, delay_ms=800)
+            deep_sleep = parse_background_sleep_intent(self._last_command_text or "")
+            self._after_speech_begins(
+                lambda: self._finish_hide(deep_sleep=deep_sleep),
+                delay_ms=800,
+            )
             self._set_pending_add(False)
             return True
 
@@ -1991,7 +2698,7 @@ class QuestWidget(QtWidgets.QWidget):
             if not parse_quit_intent(self._last_command_text or ""):
                 return False
             if not self._should_accept_control_action("quit"):
-                return True
+                return False
             self._jarvis_say("Goodbye, sir.", on_done=self._schedule_quit_after_goodbye)
             return True
 
@@ -2008,19 +2715,58 @@ class QuestWidget(QtWidgets.QWidget):
             return True
 
         if action.kind == "open_browser":
-            self._jarvis_say("Opening browser.")
-            self._after_speech_begins(lambda: (webbrowser.open("https://www.google.com"), self.sfx.play("show")), delay_ms=700)
+            target_url, spoken = resolve_browser_destination(action.value or "")
+            self._jarvis_say(spoken)
+            self._after_speech_begins(
+                lambda u=target_url: (open_in_browser(u), self.sfx.play("show")),
+                delay_ms=700,
+            )
+            return True
+
+        if action.kind == "open_app":
+            name = (action.value or action.title or "").strip()
+            ok, spoken = launch_app(name)
+            self._jarvis_say(spoken)
+            if ok:
+                self._after_speech_begins(lambda: self.sfx.play("show"), delay_ms=700)
+            return True
+
+        if action.kind == "open_url":
+            target = canonical_open_target((action.value or "").strip()) or (action.value or "").strip()
+            ok, spoken = open_url_or_site(target)
+            self._jarvis_say(spoken)
+            if ok:
+                self._after_speech_begins(lambda: self.sfx.play("show"), delay_ms=700)
             return True
 
         if action.kind == "web_search":
             query = (action.value or "").strip()
             if query:
-                url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+                url = build_search_url(query)
                 self._jarvis_say("Searching.")
-                self._after_speech_begins(lambda: (webbrowser.open(url), self.sfx.play("show")), delay_ms=700)
+                self._after_speech_begins(
+                    lambda u=url: (open_in_browser(u), self.sfx.play("show")),
+                    delay_ms=700,
+                )
             else:
                 self._jarvis_say("Opening browser.")
-                self._after_speech_begins(lambda: (webbrowser.open("https://www.google.com"), self.sfx.play("show")), delay_ms=700)
+                self._after_speech_begins(
+                    lambda: (open_in_browser("https://www.google.com"), self.sfx.play("show")),
+                    delay_ms=700,
+                )
+            return True
+
+        if action.kind == "download_search":
+            query = (action.value or "").strip()
+            if query:
+                url = build_search_url(query, download=True)
+                self._jarvis_say(f"Searching for a download, sir.")
+                self._after_speech_begins(
+                    lambda u=url: (open_in_browser(u), self.sfx.play("show")),
+                    delay_ms=700,
+                )
+            else:
+                self._jarvis_say("What should I download, sir?")
             return True
 
         return False
@@ -2030,10 +2776,11 @@ class QuestWidget(QtWidgets.QWidget):
         self.show_and_raise()
         self.sfx.play("show")
 
-    def _finish_hide(self) -> None:
+    def _finish_hide(self, *, deep_sleep: bool = False) -> None:
         try:
             self._hide_pending = False
-            self.state.jarvis_awake = False
+            if deep_sleep:
+                self.state.jarvis_awake = False
             self._pause_fx_render()
             self.sfx.play("hide")
             self.hide()
@@ -2047,6 +2794,10 @@ class QuestWidget(QtWidgets.QWidget):
         app = QtWidgets.QApplication.instance()
         if app is not None:
             app.quit()
+
+    def _quit_assistance_confirmed(self) -> None:
+        """Quit after the user approved the permission dialog (skip echo/cooldown guards)."""
+        self._jarvis_say("Goodbye, sir.", on_done=self._schedule_quit_after_goodbye)
 
     def _schedule_quit_after_goodbye(self) -> None:
         QtCore.QMetaObject.invokeMethod(
@@ -2062,6 +2813,10 @@ class QuestWidget(QtWidgets.QWidget):
 
     def _should_accept_control_action(self, kind: str) -> bool:
         now = time.monotonic()
+        if kind == "show" and not self.isVisible():
+            self._last_control_kind = kind
+            self._last_control_at = now
+            return True
         if self._last_control_kind == kind and (now - self._last_control_at) < self._CONTROL_COOLDOWN_S:
             return False
         self._last_control_kind = kind
@@ -2080,9 +2835,20 @@ class QuestWidget(QtWidgets.QWidget):
         return False
 
     def _sync_voice_gate(self) -> None:
-        # While Jarvis is awake and the mic is on, listen without "Jarvis".
-        require_wake = not (self.state.jarvis_awake and self.state.listening_requested)
-        self.voice.set_wake_word_required(require_wake)
+        listening = self.state.listening_requested
+        visible = self.isVisible()
+        awake = self.state.jarvis_awake
+        # Visible + awake: talk naturally. Hidden: require "Jarvis" to start a session.
+        require_wake = not (visible and awake and listening)
+        background_mode = not visible and listening
+        window_s = (
+            _BACKGROUND_COMMAND_WINDOW_S if background_mode else _DEFAULT_COMMAND_WINDOW_S
+        )
+        self.voice.set_wake_gate_mode(
+            require_wake_word=require_wake,
+            background_mode=background_mode,
+            command_window_s=window_s,
+        )
         if self.state.listening_requested:
             self._set_footer_default()
 
@@ -2269,13 +3035,25 @@ class QuestWidget(QtWidgets.QWidget):
     @QtCore.Slot(str)
     def _on_voice_text_ui(self, text: str) -> None:
         try:
-            if time.monotonic() < self._voice_grace_until:
+            panel_open = self._memory_panel_visible()
+            memory_intent = resolve_memory_intent(text, memory_panel_open=panel_open)
+            is_memory_cmd = memory_intent is not None
+            is_summon = parse_show_intent(text) and not is_memory_cmd
+            if not is_memory_cmd and not is_summon and time.monotonic() < self._voice_grace_until:
                 return
-            if not self._is_meaningful_voice_text(text):
+            if not is_memory_cmd and not is_summon and not self._is_meaningful_voice_text(text):
                 return
-            if self._is_tts_echo(text):
+            if not is_memory_cmd and not is_summon and self._is_tts_echo(text):
                 return
-            if self._is_duplicate_voice_text(text):
+            if not is_memory_cmd and not is_summon and self._is_duplicate_voice_text(text):
+                return
+            if not self.isVisible() and self.state.listening_requested:
+                self.state.jarvis_awake = True
+            if is_memory_cmd or is_summon:
+                self._voice_command_queue.clear()
+                self._voice_command_busy = False
+                log_voice(f"{'memory' if is_memory_cmd else 'summon'} {text!r}")
+                self._apply_text(text, source="voice")
                 return
             self._queue_voice_command(text)
         except Exception as exc:
@@ -2285,6 +3063,7 @@ class QuestWidget(QtWidgets.QWidget):
         text = (text or "").strip()
         if not text:
             return
+        log_voice(f"heard {text!r}")
         self._voice_command_queue.append(text)
         dropped = 0
         if len(self._voice_command_queue) > self._VOICE_QUEUE_MAX:
@@ -2479,6 +3258,9 @@ class QuestWidget(QtWidgets.QWidget):
     def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802
         self.state.jarvis_awake = True
         super().showEvent(event)
+        if not self._events_started:
+            self._events_started = True
+            self._event_service.start()
         self._hide_from_taskbar(self)
         if (
             self.state.listening_requested
@@ -2490,9 +3272,9 @@ class QuestWidget(QtWidgets.QWidget):
         self._sync_fx_timer()
         self._sync_voice_gate()
         self._sync_privacy_button()
+        QtCore.QTimer.singleShot(0, self._position_memory_tab)
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:  # noqa: N802
-        self.state.jarvis_awake = False
         self._pause_fx_render()
         super().hideEvent(event)
         self._sync_voice_gate()
@@ -2504,6 +3286,8 @@ class QuestWidget(QtWidgets.QWidget):
     def _default_footer_text(self) -> str:
         if not self.state.listening_requested:
             return "Privacy mode: microphone is off. Click the red button to listen again."
+        if not self.isVisible():
+            return 'Hidden — say "Jarvis …" to start, then give your command.'
         if self.state.jarvis_awake:
             if self.brain.is_enabled:
                 return "Jarvis is awake. Just talk naturally — no exact phrases needed."

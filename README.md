@@ -117,7 +117,33 @@ Install the free local LLM (Ollama + `qwen2.5:3b`):
 
 ## Voice (local, optional)
 
-Voice uses Vosk (offline). Download an English model, unzip it, then point the app at it using an environment variable:
+Voice uses **Vosk** by default (offline, low latency). Speech is segmented with **energy VAD** (end-of-utterance) before recognition.
+
+Optional **faster-whisper** backend for A/B comparison on your PC:
+
+```powershell
+pip install -r requirements-whisper.txt
+$env:JARVIS_STT_BACKEND = "ab"   # vosk (default) | whisper | ab
+python -m quest_assistant
+```
+
+Tune pause detection (milliseconds of silence before a phrase is finalized):
+
+```powershell
+$env:JARVIS_VAD_SILENCE_MS = "700"          # default; try 550–900
+$env:JARVIS_VAD_ENERGY_THRESHOLD = "380"    # raise if room is noisy
+```
+
+Whisper model (CPU, quantized):
+
+```powershell
+$env:JARVIS_STT_WHISPER_MODEL = "tiny.en"
+$env:JARVIS_STT_WHISPER_COMPUTE = "int8"
+```
+
+A/B mode logs both transcripts to `%USERPROFILE%\.quest_assistant\logs\voice.log`.
+
+Download the Vosk English model:
 
 ```powershell
 $env:VOSK_MODEL_PATH="C:\path\to\vosk-model-small-en-us-0.15"

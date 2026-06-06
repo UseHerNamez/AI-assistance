@@ -10,7 +10,7 @@ import dateparser
 
 @dataclass(frozen=True)
 class ParsedAction:
-    kind: str  # "add" | "add_done" | "complete" | "delete" | "edit" | "show" | "hide" | "listen_off" | "quit" | "set_fx" | "open_browser" | "web_search" | "noop"
+    kind: str  # "add" | ... | "open_browser" | "web_search" | "open_app" | "open_url" | "noop"
     title: Optional[str] = None
     quest_number: Optional[int] = None
     value: Optional[str] = None
@@ -97,7 +97,11 @@ _RE_VOICE_PREFIX = re.compile(
     r"i\s+want\s+you\s+to|go\s+ahead\s+and|i\s+need\s+you\s+to)\s+)+",
     re.IGNORECASE,
 )
-_RE_EDIT_VERB = r"(?:edit|rename|change|fix|correct|update|call)"
+_RE_EDIT_VERB = r"(?:edit|rename|change|fix|correct|update)"
+_RE_NON_QUEST_EDIT_OLD = re.compile(
+    r"^(?:my|me)\s+(?:password|account|email|phone|pin|address|name)\b",
+    re.IGNORECASE,
+)
 _RE_EDIT_BY_NUM = re.compile(
     rf"^\s*(?:{_RE_EDIT_VERB})\s+(?:(?:task|quest|mission|number)\s+)?"
     r"#?(?P<num>\d+|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
@@ -117,7 +121,23 @@ _RE_VOICE_EDIT_PREFIX = re.compile(
     re.IGNORECASE,
 )
 _RE_DONE_PREFIX = re.compile(r"^\s*(done|complete|finish)\b", re.IGNORECASE)
-_RE_SHOW = re.compile(r"^\s*(?:hey\s+)?(wake\s*up|open\s*up|show|appear)\b", re.IGNORECASE)
+_RE_SHOW = re.compile(
+    r"^\s*(?:hey\s+)?(?:"
+    r"wake\s*up|wakeup|"
+    r"open\s*up|openup|"
+    r"show(?:\s+(?:up|yourself|window|assistance|me))?|"
+    r"appear"
+    r")\b",
+    re.IGNORECASE,
+)
+_RE_BARE_OPEN_SHOW = re.compile(
+    r"^\s*open(?:\s+(?:up|please|now|sir))?\s*[.!,?]*\s*$",
+    re.IGNORECASE,
+)
+_RE_WAKE_SHOW = re.compile(
+    r"^\s*wake(?:\s+up|\s+now|\s+sir)?\s*[.!,?]*\s*$",
+    re.IGNORECASE,
+)
 _RE_HIDE = re.compile(r"^\s*(sleep|go\s*away|hide|disappear|close)\b", re.IGNORECASE)
 _RE_HIDE_INTENTS = (
     re.compile(
@@ -175,17 +195,42 @@ _RE_LISTEN_OFF_HINTS = re.compile(
 )
 _RE_OPEN_BROWSER = re.compile(
     r"^\s*(?:please\s+|can\s+you\s+|just\s+)?"
-    r"(?:open|launch|start)\s+(?:the\s+)?(?:web\s+)?browser(?:\s+(?:now|please))?\s*$",
+    r"(?:open|launch|start)\s+(?:(?:the|a|my)\s+)?(?:(?:web|internet)\s+)?"
+    r"(?:in\s+(?:(?:the|a|my)\s+)?)?(?:browser|browsers)(?:\s+(?:now|please|sir))?\s*$",
     re.IGNORECASE,
 )
 _RE_WEB_SEARCH = re.compile(
-    r"^\s*(?:please\s+|can\s+you\s+|just\s+)?"
+    r"^\s*(?:please\s+|can\s+you\s+|could\s+you\s+|just\s+)?"
     r"(?:"
     r"search\s+(?:google|the\s+(?:web|internet)|online)(?:\s+for)?|"
+    r"search\s+for|"
     r"google(?:\s+search)?(?:\s+for)?|"
-    r"look\s+up(?:\s+online)?"
+    r"look\s+up(?:\s+online)?|"
+    r"look\s+for|"
+    r"find(?:\s+me)?|"
+    r"browse\s+for"
     r")\s+(.+)\s*$",
     re.IGNORECASE,
+)
+_RE_DOWNLOAD = re.compile(
+    r"^\s*(?:(?:hey|ok|okay)\s+)?(?:(?:jarvis|please|can\s+you|could\s+you|would\s+you|just)\s+)*"
+    r"(?:download|fetch|grab|get\s+me)\s+(?P<query>.+?)(?:\s+(?:please|now|sir))?\s*$",
+    re.IGNORECASE,
+)
+_RE_OPEN_TARGET = re.compile(
+    r"^\s*(?:(?:hey|ok|okay)\s+)?(?:(?:jarvis|please|can\s+you|could\s+you|would\s+you|just|i\s+need\s+you\s+to)\s+)*"
+    r"(?:open|launch|start|run|load)\s+(?:the\s+|my\s+)?(?P<target>.+?)(?:\s+(?:now|please|sir))?\s*$",
+    re.IGNORECASE,
+)
+_BROWSER_ONLY_TARGETS = frozenset(
+    {
+        "browser",
+        "web",
+        "web browser",
+        "internet",
+        "internet browser",
+        "the browser",
+    }
 )
 _RE_ENUM_MARKER = re.compile(
     r"\b(?:"
@@ -442,6 +487,10 @@ def parse_hide_intent(text: str) -> bool:
     raw = (text or "").strip()
     if not raw or parse_quit_intent(text):
         return False
+    from quest_assistant.memory.detect import looks_like_memory_panel_intent
+
+    if looks_like_memory_panel_intent(text):
+        return False
     if _RE_HIDE.match(raw):
         return True
     return any(pattern.search(raw) for pattern in _RE_HIDE_INTENTS)
@@ -531,10 +580,27 @@ def looks_like_chat(text: str) -> bool:
         or parse_quit_intent(text)
         or parse_hide_intent(text)
         or parse_open_browser_intent(text)
+        or parse_open_target(text)
+        or parse_download_search_query(text)
         or parse_web_search_query(text)
         or parse_fx_enabled(text) is not None
         or resolve_fx_enabled(text) is not None
     ):
+        return False
+    from quest_assistant.memory.detect import (
+        looks_like_memory_panel_intent,
+        parse_hide_memory_intent,
+        parse_show_memory_intent,
+    )
+    from quest_assistant.compose.detect import parse_compose_request
+
+    if (
+        parse_show_memory_intent(text)
+        or parse_hide_memory_intent(text)
+        or looks_like_memory_panel_intent(text)
+    ):
+        return False
+    if parse_compose_request(text):
         return False
     quick = parse_action(raw, allow_implicit_add=False)
     if quick.kind not in {"noop"}:
@@ -634,6 +700,76 @@ def parse_open_browser_intent(text: str) -> bool:
     return bool(_RE_OPEN_BROWSER.match((text or "").strip()))
 
 
+def parse_background_sleep_intent(text: str) -> bool:
+    """Hide to the tray and require the wake word again (sleep / go away)."""
+    raw = normalize_voice_command(text)
+    if not raw:
+        return False
+    return bool(re.match(r"^\s*(?:sleep|go\s*away)\b", raw, re.IGNORECASE))
+
+
+def _matches_show(raw: str) -> bool:
+    if not raw:
+        return False
+    from quest_assistant.memory.detect import looks_like_memory_panel_intent
+
+    if looks_like_memory_panel_intent(raw):
+        return False
+    if _RE_BARE_OPEN_SHOW.match(raw) or _RE_WAKE_SHOW.match(raw):
+        return True
+    if _RE_SHOW.match(raw):
+        # "show me" alone summons the window; "show me what you remember" is memory.
+        if re.match(r"^\s*show\s+me\s+(?:what|your|the)\b", raw, re.IGNORECASE):
+            return False
+        return True
+    lower = raw.lower()
+    return bool(
+        re.search(r"\b(?:come\s+back|where\s+are\s+you|show\s+yourself|need\s+you\s+back)\b", lower)
+    )
+
+
+def parse_show_intent(text: str) -> bool:
+    raw = normalize_voice_command(text)
+    return _matches_show(raw)
+
+
+def parse_download_search_query(text: str) -> Optional[str]:
+    raw = normalize_voice_command(text)
+    match = _RE_DOWNLOAD.match(raw)
+    if not match:
+        return None
+    query = (match.group("query") or "").strip(" .,!?;:")
+    return query or None
+
+
+def parse_open_target(text: str) -> Optional[tuple[str, str]]:
+    """
+    Parse open/launch/start commands.
+    Returns (kind, target) where kind is 'app' or 'url'.
+    """
+    raw = normalize_voice_command(text)
+    match = _RE_OPEN_TARGET.match(raw)
+    if not match:
+        return None
+    target = (match.group("target") or "").strip(" .,!?;:")
+    if not target:
+        return None
+    from quest_assistant.system.launcher import canonical_open_target, classify_open_target
+
+    target = canonical_open_target(target)
+    if not target:
+        return None
+    if re.fullmatch(r"memory(?:\s+(?:tab|panel|bank|log|section))?", target.lower()):
+        return None
+    if target.lower() in {"up", "up now", "up please"}:
+        return None
+    lower = target.lower()
+    if lower in _BROWSER_ONLY_TARGETS or re.fullmatch(r"(?:web\s+)?(?:in\s+)?browser(?:s)?", lower):
+        return None
+    kind = classify_open_target(target)
+    return kind, target
+
+
 def parse_web_search_query(text: str) -> Optional[str]:
     raw = (text or "").strip()
     match = _RE_WEB_SEARCH.match(raw)
@@ -708,6 +844,8 @@ def parse_fx_enabled(text: str) -> Optional[bool]:
 
 def resolve_fx_enabled(text: str) -> Optional[bool]:
     """Strict FX patterns first, then casual phrasing (effects off, disable glow, etc.)."""
+    if parse_show_intent(text) or parse_hide_intent(text) or parse_background_sleep_intent(text):
+        return None
     enabled = parse_fx_enabled(text)
     if enabled is not None:
         return enabled
@@ -874,7 +1012,7 @@ def parse_action(text: str, *, allow_implicit_add: bool = True) -> ParsedAction:
     if parse_quit_intent(raw):
         return ParsedAction(kind="quit", raw=text)
 
-    if _RE_SHOW.match(raw):
+    if _matches_show(raw):
         return ParsedAction(kind="show", raw=text)
 
     if parse_hide_intent(raw):
@@ -885,6 +1023,15 @@ def parse_action(text: str, *, allow_implicit_add: bool = True) -> ParsedAction:
 
     if parse_open_browser_intent(raw):
         return ParsedAction(kind="open_browser", raw=text)
+
+    open_target = parse_open_target(raw)
+    if open_target is not None:
+        kind, target = open_target
+        return ParsedAction(kind=f"open_{kind}", value=target, raw=text)
+
+    download_query = parse_download_search_query(raw)
+    if download_query is not None:
+        return ParsedAction(kind="download_search", value=download_query, raw=text)
 
     query = parse_web_search_query(raw)
     if query is not None:
@@ -906,7 +1053,7 @@ def parse_action(text: str, *, allow_implicit_add: bool = True) -> ParsedAction:
         old_ref = (m.group("old") or "").strip(" :.-")
         old_ref = re.sub(r"^(?:task|quest|mission)\s+", "", old_ref, flags=re.IGNORECASE).strip(" :.-")
         new_title = normalize_quest_title(m.group("new"))
-        if old_ref and new_title:
+        if old_ref and new_title and not _RE_NON_QUEST_EDIT_OLD.match(old_ref):
             return ParsedAction(kind="edit", title=old_ref, value=new_title, raw=text)
 
     m = _RE_DELETE_BY_NUM.match(raw)

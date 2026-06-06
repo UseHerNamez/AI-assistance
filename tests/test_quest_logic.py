@@ -162,6 +162,28 @@ class ParserTests(unittest.TestCase):
 
         self.assertFalse(parse_action("change of plans", allow_implicit_add=False).kind == "edit")
 
+    def test_edit_rejects_non_quest_phrases(self) -> None:
+        self.assertNotEqual(parse_action("call me a taxi to the airport", allow_implicit_add=False).kind, "edit")
+        self.assertNotEqual(parse_action("change my password to something", allow_implicit_add=False).kind, "edit")
+
+    def test_open_task_ids_batch_snapshot(self) -> None:
+        from quest_assistant.ui_widget import QuestWidget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = QuestDB(Path(tmp) / "batch.db")
+            try:
+                db.add_task("one")
+                db.add_task("two")
+                db.add_task("three")
+                widget = QuestWidget.__new__(QuestWidget)
+                widget.db = db
+                ids = widget._open_task_ids_for_batch_targets(numbers=[1, 3], titles=[])
+                self.assertEqual(len(ids), 2)
+                titles = {db.get_task(tid).title for tid in ids}
+                self.assertEqual(titles, {"one", "three"})
+            finally:
+                db.close()
+
 
 class QuestDBTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -171,7 +172,12 @@ class LocalLLMInterpreter:
             "listen_off",
             "quit",
             "open_browser",
+            "open_app",
+            "open_url",
             "web_search",
+            "download_search",
+            "show_memory",
+            "hide_memory",
             "reply",
         }
     )
@@ -184,6 +190,7 @@ class LocalLLMInterpreter:
         jarvis_awake: bool = False,
         open_quests: Optional[list[dict[str, object]]] = None,
         source: str = "voice",
+        memory_context: Optional[str] = None,
     ) -> Optional[LLMResult]:
         if not self.is_enabled and not (source == "voice" and jarvis_awake and self.may_use_ollama):
             return None
@@ -200,6 +207,7 @@ class LocalLLMInterpreter:
                 pending_add=pending_add,
                 jarvis_awake=jarvis_awake,
                 open_quests=open_quests or [],
+                memory_context=memory_context,
             )
             outer = self._post_chat(payload, timeout_s=timeout_s)
             raw = json.dumps(outer)
@@ -251,6 +259,7 @@ class LocalLLMInterpreter:
         pending_add: bool = False,
         jarvis_awake: bool = False,
         open_quests: Optional[list[dict[str, object]]] = None,
+        memory_context: Optional[str] = None,
     ) -> Optional[LLMResult]:
         """
         Command JSON first; if Jarvis is awake and nothing useful came back, free chat.
@@ -261,12 +270,13 @@ class LocalLLMInterpreter:
             jarvis_awake=jarvis_awake,
             open_quests=open_quests,
             source="voice",
+            memory_context=memory_context,
         )
         if result and self._has_useful_actions(result.actions):
             return result
         if not jarvis_awake or not self.may_use_ollama:
             return result
-        reply = self.converse(text, jarvis_awake=True)
+        reply = self.converse(text, jarvis_awake=True, memory_context=memory_context)
         if not reply:
             return result
         return LLMResult(
@@ -275,7 +285,13 @@ class LocalLLMInterpreter:
             model=self.model,
         )
 
-    def converse(self, text: str, *, jarvis_awake: bool = False) -> Optional[str]:
+    def converse(
+        self,
+        text: str,
+        *,
+        jarvis_awake: bool = False,
+        memory_context: Optional[str] = None,
+    ) -> Optional[str]:
         """Plain conversational reply — no JSON action schema."""
         if not self.may_use_ollama:
             return None
@@ -290,6 +306,8 @@ class LocalLLMInterpreter:
             + mood
             + " Do not invent quest actions; just converse."
         )
+        if memory_context:
+            system = system + "\n\n" + memory_context
         payload = {
             "model": self.model,
             "stream": False,
@@ -325,6 +343,107 @@ class LocalLLMInterpreter:
         if reply.startswith("```"):
             reply = reply.strip("`").removeprefix("json").strip()
         return reply or None
+
+    def compose_document(
+        self,
+        topic: str,
+        *,
+        destination: str = "notepad",
+        memory_context: Optional[str] = None,
+    ) -> Optional[str]:
+        """Draft prose for Notepad, Word, or an Outlook email."""
+        if not self.may_use_ollama:
+            return None
+        topic = (topic or "").strip()
+        if not topic:
+            return None
+        dest = (destination or "notepad").lower()
+        if dest == "outlook":
+            doc_hint = (
+                "Write a complete email the user can send. Include a greeting, clear body "
+                "paragraphs, and a polite sign-off. End with 'Best regards,' on its own line."
+            )
+        elif dest == "word":
+            doc_hint = "Write a polished document with short paragraphs suitable for Microsoft Word."
+        else:
+            doc_hint = "Write clear plain text suitable for a simple text file."
+
+        system = (
+            "You are Jarvis — draft writing for the user. Output ONLY the document body. "
+            "No quotes, labels, or commentary. "
+            + doc_hint
+        )
+        if memory_context:
+            system = system + "\n\n" + memory_context
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "keep_alive": "30m",
+            "options": {"temperature": 0.5, "num_predict": 700},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Write about: {topic}"},
+            ],
+        }
+        try:
+            raw = self._post_chat(payload, timeout_s=45.0)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            self._note_failure()
+            return None
+
+        self._fail_count = 0
+        content = (raw.get("message", {}).get("content", "") or "").strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```[a-z]*\n?", "", content)
+            content = re.sub(r"\n?```$", "", content).strip()
+        return content or None
+
+    def summarize_research(
+        self,
+        query: str,
+        *,
+        memory_context: Optional[str] = None,
+    ) -> Optional[tuple[str, str]]:
+        """
+        Planner step: short summary + one-line quest title for a research query.
+        Returns (summary, quest_title) or None if the model is unavailable.
+        """
+        if not self.may_use_ollama:
+            return None
+        system = (
+            "You help plan research tasks. Given a research query, reply with JSON only: "
+            '{"summary":"2-3 sentences of practical guidance","quest_title":"short quest title"}. '
+            "Be concise; do not invent specific product SKUs or prices."
+        )
+        if memory_context:
+            system = system + "\n\n" + memory_context
+        payload = {
+            "model": self.model,
+            "stream": False,
+            "format": "json",
+            "keep_alive": "30m",
+            "options": {"temperature": 0.2, "num_predict": 160},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": query},
+            ],
+        }
+        try:
+            raw = self._post_chat(payload, timeout_s=20.0)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return None
+        content = raw.get("message", {}).get("content", "")
+        try:
+            parsed = _loads_json_object(content)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        summary = str(parsed.get("summary") or "").strip()
+        title = normalize_quest_title(str(parsed.get("quest_title") or ""))
+        if not summary:
+            return None
+        if not title:
+            title = normalize_quest_title(query[:80]) or "Research task"
+        return summary, title
 
     @staticmethod
     def _has_useful_actions(actions: list[LLMAction]) -> bool:
@@ -367,6 +486,7 @@ class LocalLLMInterpreter:
         pending_add: bool,
         jarvis_awake: bool,
         open_quests: list[dict[str, object]],
+        memory_context: Optional[str] = None,
     ) -> dict[str, Any]:
         # Keep this prompt SHORT. On modest hardware, prompt length dominates
         # latency, so a compact instruction keeps responses near ~1.5-3s.
@@ -387,12 +507,20 @@ class LocalLLMInterpreter:
             "add(title); edit(title old ref, value new title); "
             "complete(title or task number); "
             "delete(title or number) ONLY when the user clearly asks to delete/remove; "
-            "open_browser; web_search(value query); "
+            "open_app(value app name e.g. Outlook, League of Legends, Chrome); "
+            "open_url(value site name or URL e.g. youtube, github.com); "
+            "open_browser(value optional URL); "
+            "web_search(value query); "
+            "download_search(value what to download e.g. vlc, python); "
+            "show_memory when the user wants to view/open stored memory, prefs, facts, or what you remember; "
+            "hide_memory when the user wants to close/hide the memory panel or tab; "
             "reply(value) for ANY conversation, greeting, or question (e.g. are you here, how are you); "
             "noop only if you cannot infer anything. "
             "open_quests lists numbered tasks. "
             'Return {"actions":[{"kind":"...","title":null,"value":null}]}.'
         )
+        if memory_context:
+            system = system + "\n\n" + memory_context
         user = json.dumps(
             {
                 "pending_add": pending_add,
@@ -432,5 +560,10 @@ def _clean_value(value: Any) -> Optional[str]:
     if value is None:
         return None
     text = str(value).strip()
-    return text or None
+    if not text:
+        return None
+    lower = text.lower()
+    if lower.endswith("_browser") or lower.startswith("open_"):
+        return None
+    return text
 

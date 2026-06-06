@@ -3,12 +3,16 @@ from __future__ import annotations
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 VALID_STATUSES = frozenset({"open", "done"})
 _MIN_TITLE_NEEDLE_LEN = 2
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
 def _app_dir() -> Path:
@@ -86,7 +90,7 @@ class QuestDB:
         cleaned = (title or "").strip()
         if not cleaned:
             return None
-        now = datetime.utcnow().isoformat(timespec="seconds")
+        now = _utc_now_iso()
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
@@ -102,7 +106,7 @@ class QuestDB:
     def set_status(self, task_id: int, status: str) -> None:
         if status not in VALID_STATUSES:
             raise ValueError(f"invalid task status: {status!r}")
-        now = datetime.utcnow().isoformat(timespec="seconds")
+        now = _utc_now_iso()
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
@@ -129,7 +133,7 @@ class QuestDB:
         cleaned = (title or "").strip()
         if not cleaned:
             return False
-        now = datetime.utcnow().isoformat(timespec="seconds")
+        now = _utc_now_iso()
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(

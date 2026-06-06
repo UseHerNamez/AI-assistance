@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -114,14 +114,35 @@ def _query_first(command: str) -> str:
     return lines[0] if lines else "Unknown CPU"
 
 
+def _hidden_subprocess_kwargs() -> dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "startupinfo": startupinfo,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+    }
+
+
 def _query_lines(command: str) -> list[str]:
     try:
         completed = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
+            [
+                "powershell",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                command,
+            ],
             capture_output=True,
             text=True,
             timeout=4,
             check=False,
+            **_hidden_subprocess_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return []

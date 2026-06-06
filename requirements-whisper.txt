@@ -1,0 +1,3 @@
+# Optional: faster-whisper STT backend (CPU-friendly quantized models).
+# Install after base requirements: pip install -r requirements.txt -r requirements-whisper.txt
+faster-whisper>=1.0.0

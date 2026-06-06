@@ -8,7 +8,11 @@ from pathlib import Path
 from PySide6 import QtCore, QtWidgets
 
 from quest_assistant.db import QuestDB
-from quest_assistant.single_instance import acquire_single_instance_lock
+from quest_assistant.single_instance import (
+    acquire_single_instance_lock,
+    start_activation_server,
+    try_activate_running_instance,
+)
 from quest_assistant.ui_widget import QuestWidget
 
 
@@ -53,6 +57,7 @@ def main() -> int:
 
     instance_lock = acquire_single_instance_lock()
     if instance_lock is None:
+        try_activate_running_instance()
         return 0
 
     # Keep the lock alive for the lifetime of this process.
@@ -60,6 +65,7 @@ def main() -> int:
 
     db = QuestDB()
     w = QuestWidget(db)
+    _activation_server = start_activation_server(w.show_and_raise)
 
     # Start hidden: show only when commanded (e.g. "Jarvis wake up").
     w.hide()
@@ -107,4 +113,12 @@ def main() -> int:
         except Exception:
             pass
         db.close()
+        try:
+            w.memory.close()
+        except Exception:
+            pass
+        try:
+            w._event_service.stop()
+        except Exception:
+            pass
 
