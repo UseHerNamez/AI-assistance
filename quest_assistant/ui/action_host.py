@@ -194,8 +194,12 @@ class QuestActionHost:
         if name == T.TOOL_START_ADD:
             w._set_pending_add(True)
             w._set_pending_delete(False)
-            w.footer.setText('Say the quest naturally, or say "next quest..." for more.')
-            w._jarvis_say("Of course. Tell me the quest, or say next quest for more.")
+            if args.get("daily"):
+                w.footer.setText('Say the daily quest, e.g. "daily brush teeth".')
+                w._jarvis_say("Of course. Tell me the daily quest to repeat every day.")
+            else:
+                w.footer.setText('Say the quest naturally, or say "next quest..." for more.')
+                w._jarvis_say("Of course. Tell me the quest, or say next quest for more.")
             return ToolResult(ok=True, spoke=True)
 
         if name == T.TOOL_STOP_ADD:
@@ -209,6 +213,30 @@ class QuestActionHost:
             w.footer.setText("Say the quest name or number to delete.")
             w._jarvis_say("Which quest should I delete, sir? Say the name or task number.")
             return ToolResult(ok=True, spoke=True)
+
+        if name == T.TOOL_CREATE_DAILY_TASK:
+            titles = list(args.get("titles") or [])
+            raw_input = args.get("raw_input")
+            source = args.get("source") or getattr(w, "_last_apply_source", "voice")
+            added = 0
+            for title in titles:
+                if w.db.add_daily_task(title, source=source, raw_input=raw_input) is not None:
+                    added += 1
+            if not added:
+                return ToolResult(ok=False)
+            w.sfx.play("add")
+            for title in titles:
+                try:
+                    w.memory.record_quest_event("add_daily", title=title)
+                except Exception:
+                    pass
+            if added == 1:
+                w._jarvis_say(f"Done, sir. I added the daily quest: {titles[0]}.")
+            else:
+                w._jarvis_say(f"Done, sir. I added {added} daily quests.")
+            w._set_pending_add(False)
+            w._set_footer_default()
+            return ToolResult(ok=True, spoke=True, refresh=True)
 
         if name == T.TOOL_CREATE_TASK:
             titles = list(args.get("titles") or [])

@@ -21,6 +21,22 @@ class ParsedAction:
 _RE_MULTI_SPLIT = re.compile(r"\s*(?:,|;|\band\b|\bthen\b|\balso\b|\bplus\b)\s*", re.IGNORECASE)
 _RE_DELETE = re.compile(r"^\s*(delete|remove|deleted)\b", re.IGNORECASE)
 _RE_ADD = re.compile(r"^\s*(add|new|create)\b", re.IGNORECASE)
+_RE_DAILY_MARKER = re.compile(
+    r"\b(?:"
+    r"daily|every\s+day|each\s+day|repeat(?:ing)?(?:\s+daily)?|recurring|"
+    r"every\s+morning|every\s+evening"
+    r")\b",
+    re.IGNORECASE,
+)
+_RE_DAILY_ADD_PREFIX = re.compile(
+    r"^\s*(?:"
+    r"(?:add|create|new|make|record|log|write\s+down|put\s+down)\s+"
+    r"(?:a\s+)?(?:daily|repeating|recurring)\s+(?:task|quest|mission)?|"
+    r"daily\s+(?:task|quest|mission)?|"
+    r"(?:repeating|recurring)\s+(?:daily\s+)?(?:task|quest|mission)?"
+    r")\s*",
+    re.IGNORECASE,
+)
 _RE_ADD_INTENT = re.compile(
     r"\b(?:"
     r"add|create|new|make|record|log|write\s+down|put\s+down|"
@@ -296,11 +312,48 @@ def extract_add_titles(text: str) -> list[str]:
     raw = (text or "").strip()
     if not raw or not has_add_intent(raw):
         return []
+    if has_daily_add_intent(raw):
+        return extract_daily_add_titles(raw)
 
     body = _RE_ADD_PREFIX.sub("", raw, count=1).strip(" .,:;-")
     if not body or _RE_ADD_BODY_PLACEHOLDER.match(body):
         return []
     return extract_quest_titles(body)
+
+
+def has_daily_add_intent(text: str) -> bool:
+    raw = normalize_voice_command(text)
+    return bool(raw and _RE_DAILY_MARKER.search(raw))
+
+
+def strip_daily_markers(text: str) -> str:
+    raw = normalize_voice_command(text)
+    raw = _RE_DAILY_ADD_PREFIX.sub("", raw, count=1).strip(" .,:;-")
+    raw = _RE_DAILY_MARKER.sub("", raw)
+    raw = re.sub(r"\s+", " ", raw).strip(" .,:;-")
+    return raw
+
+
+def extract_daily_add_titles(text: str) -> list[str]:
+    raw = (text or "").strip()
+    if not raw or not has_daily_add_intent(raw):
+        return []
+
+    if has_add_intent(raw):
+        body = _RE_ADD_PREFIX.sub("", raw, count=1).strip(" .,:;-")
+    else:
+        body = raw
+    body = strip_daily_markers(body)
+    if not body or _RE_ADD_BODY_PLACEHOLDER.match(body):
+        return []
+    return extract_quest_titles(body)
+
+
+def looks_like_daily_typed_quest(text: str) -> bool:
+    raw = (text or "").strip()
+    if not has_daily_add_intent(raw):
+        return False
+    return bool(extract_daily_add_titles(raw))
 
 
 def extract_quest_titles(text: str) -> list[str]:
@@ -715,6 +768,8 @@ def looks_like_typed_quest(text: str) -> bool:
     ):
         return False
     if re.fullmatch(r"(?:hi|hello|hey|thanks|thank you|ok(?:ay)?|yes|no|test)\.?", lower):
+        return False
+    if has_daily_add_intent(raw):
         return False
     quick = parse_action(raw, allow_implicit_add=False)
     if quick.kind not in {"noop", "add"}:
@@ -1191,6 +1246,9 @@ def parse_action(text: str, *, allow_implicit_add: bool = True) -> ParsedAction:
     # If it's an add/create/record intent, treat it as add.
     title = raw
     if has_add_intent(raw):
+        if has_daily_add_intent(raw):
+            titles = extract_daily_add_titles(raw)
+            return ParsedAction(kind="add_daily", title=titles[0] if titles else None, raw=text)
         titles = extract_add_titles(raw)
         title = titles[0] if titles else ""
         due_iso = _parse_due_iso(raw)
@@ -1201,6 +1259,11 @@ def parse_action(text: str, *, allow_implicit_add: bool = True) -> ParsedAction:
 
     if looks_like_chat(raw):
         return ParsedAction(kind="noop", raw=text)
+
+    if has_daily_add_intent(raw):
+        titles = extract_daily_add_titles(raw)
+        if titles:
+            return ParsedAction(kind="add_daily", title=titles[0], raw=text)
 
     # Typed input can still be used as quick-add text.
     due_iso = _parse_due_iso(raw)

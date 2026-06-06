@@ -9,13 +9,16 @@ from quest_assistant.intent import tools as T
 from quest_assistant.memory.detect import parse_hide_memory_intent, parse_show_memory_intent, resolve_memory_intent
 from quest_assistant.parser import (
     extract_add_titles,
+    extract_daily_add_titles,
     extract_delete_quest_number,
     extract_quest_titles,
     has_add_intent,
+    has_daily_add_intent,
     has_numbered_quest_markers,
     infer_casual_intent,
     is_delete_title_placeholder,
     looks_like_delete_intent,
+    looks_like_daily_typed_quest,
     looks_like_listen_off,
     looks_like_typed_quest,
     normalize_quest_title,
@@ -209,19 +212,41 @@ def _allow_implicit_add(text: str, ctx: SessionContext) -> bool:
     if has_add_intent(text):
         return True
     if ctx.source == "typed":
-        return looks_like_typed_quest(text)
+        return looks_like_daily_typed_quest(text) or looks_like_typed_quest(text)
     return False
 
 
 def route_parser_actions(text: str, ctx: SessionContext) -> list[ToolCall]:
     calls: list[ToolCall] = []
-    items = [text] if extract_add_titles(text) or ctx.pending_add else split_into_items(text)
+    items = (
+        [text]
+        if extract_add_titles(text) or extract_daily_add_titles(text) or ctx.pending_add
+        else split_into_items(text)
+    )
     implicit_add = _allow_implicit_add(text, ctx)
 
     for item in items:
         action = parse_action(item, allow_implicit_add=implicit_add)
         if action.kind in {"show", "hide", "listen_off", "add_done", "quit"}:
             calls.extend(_action_kind_to_tools(action))
+            continue
+
+        if action.kind == "add_daily":
+            titles = extract_daily_add_titles(item)
+            if not titles and action.title:
+                titles = [action.title]
+            titles = [t for t in (normalize_quest_title(t) for t in titles) if t]
+            if titles:
+                calls.append(
+                    T.tool(
+                        T.TOOL_CREATE_DAILY_TASK,
+                        titles=titles,
+                        raw_input=action.raw,
+                        source=ctx.source,
+                    )
+                )
+            else:
+                calls.append(T.tool(T.TOOL_START_ADD, daily=True))
             continue
 
         if action.kind == "add":

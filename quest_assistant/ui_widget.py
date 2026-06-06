@@ -29,9 +29,11 @@ from quest_assistant.memory.detect import looks_like_memory_panel_intent, resolv
 from quest_assistant.monitor.logger import log_intent, log_voice
 from quest_assistant.parser import (
     extract_add_titles,
+    extract_daily_add_titles,
     extract_delete_quest_number,
     extract_quest_titles,
     has_add_intent,
+    has_daily_add_intent,
     has_complete_intent,
     has_delete_intent,
     has_edit_intent,
@@ -41,6 +43,7 @@ from quest_assistant.parser import (
     local_chat_reply,
     looks_like_chat,
     looks_like_delete_intent,
+    looks_like_daily_typed_quest,
     looks_like_typed_quest,
     normalize_quest_title,
     normalize_voice_command,
@@ -107,13 +110,19 @@ class UIState:
 
 @dataclass(frozen=True)
 class _QuestListSnapshot:
-    open_rows: list[tuple[int, int, str]]  # task_id, number, title
-    done_rows: list[tuple[int, str]]  # task_id, title
+    open_daily: list[tuple[int, int, str]]  # task_id, number, title
+    open_normal: list[tuple[int, int, str]]
+    done_daily: list[tuple[int, str]]
+    done_normal: list[tuple[int, str]]
     use_compact: bool
 
 
 _ROLE_TASK_ID = QtCore.Qt.ItemDataRole.UserRole
 _ROLE_QUEST_NUM = QtCore.Qt.ItemDataRole.UserRole + 1
+_ROLE_IS_SECTION = QtCore.Qt.ItemDataRole.UserRole + 2
+_ROLE_IS_SEPARATOR = QtCore.Qt.ItemDataRole.UserRole + 3
+_ROLE_QUEST_SECTION = QtCore.Qt.ItemDataRole.UserRole + 4
+_DAILY_SECTION_LABEL = "Daily (repeating)"
 
 
 class _OpenQuestListDelegate(QtWidgets.QStyledItemDelegate):
@@ -145,6 +154,14 @@ class _OpenQuestListDelegate(QtWidgets.QStyledItemDelegate):
         if opt.state & QtWidgets.QStyle.StateFlag.State_Editing:
             # Erase the painted label so only the line editor is visible.
             opt.text = ""
+        elif index.data(_ROLE_IS_SECTION):
+            opt.text = index.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
+        elif index.data(_ROLE_IS_SEPARATOR):
+            line_y = opt.rect.center().y()
+            painter.fillRect(opt.rect, QtGui.QColor(0, 0, 0, 0))
+            painter.setPen(QtGui.QPen(QtGui.QColor(71, 85, 105)))
+            painter.drawLine(opt.rect.left() + 8, line_y, opt.rect.right() - 8, line_y)
+            return
         else:
             number = index.data(_ROLE_QUEST_NUM) or (index.row() + 1)
             title = index.data(QtCore.Qt.ItemDataRole.DisplayRole) or ""
@@ -843,7 +860,9 @@ class QuestWidget(QtWidgets.QWidget):
         layout.addLayout(add_row)
 
         self.input = QtWidgets.QLineEdit()
-        self.input.setPlaceholderText('Add or rename… e.g. "wash dishes" or "rename task 1 to …"')
+        self.input.setPlaceholderText(
+            'Add or rename… e.g. "wash dishes" or "daily brush teeth"'
+        )
         self.input.returnPressed.connect(self._handle_input)
         add_row.addWidget(self.input, 1)
 
@@ -1279,13 +1298,20 @@ class QuestWidget(QtWidgets.QWidget):
         def worker() -> None:
             snapshot: Optional[_QuestListSnapshot] = None
             try:
-                open_tasks = db.list_tasks(status="open")
-                done_tasks = db.list_tasks(status="done")
-                total = len(open_tasks) + len(done_tasks)
+                buckets = db.list_quest_buckets()
+                open_daily = [
+                    (t.id, i + 1, t.title) for i, t in enumerate(buckets.open_daily)
+                ]
+                open_normal = [
+                    (t.id, i + 1, t.title) for i, t in enumerate(buckets.open_normal)
+                ]
+                done_daily = [(t.id, t.title) for t in buckets.done_daily]
+                done_normal = [(t.id, t.title) for t in buckets.done_normal]
+                total = buckets.total
                 use_compact = total > QuestWidget._COMPACT_LIST_THRESHOLD
-                open_rows = [(t.id, index, t.title) for index, t in enumerate(open_tasks, start=1)]
-                done_rows = [(t.id, t.title) for t in done_tasks]
-                snapshot = _QuestListSnapshot(open_rows, done_rows, use_compact)
+                snapshot = _QuestListSnapshot(
+                    open_daily, open_normal, done_daily, done_normal, use_compact
+                )
             except Exception as exc:
                 log_diagnostic("ui", "refresh worker failed", exc=exc)
             try:
@@ -1307,6 +1333,27 @@ class QuestWidget(QtWidgets.QWidget):
         else:
             self._sync_fx_timer()
 
+    def _add_list_section_header(self, task_list: QtWidgets.QListWidget, label: str) -> None:
+        item = QtWidgets.QListWidgetItem(label)
+        item.setData(_ROLE_IS_SECTION, True)
+        item.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+        font = item.font()
+        font.setBold(True)
+        font.setPointSize(max(font.pointSize(), 11))
+        item.setFont(font)
+        item.setForeground(QtGui.QColor("#22d3ee"))
+        item.setBackground(QtGui.QColor(15, 23, 42))
+        item.setSizeHint(QtCore.QSize(0, 28))
+        task_list.addItem(item)
+
+    def _add_list_section_separator(self, task_list: QtWidgets.QListWidget) -> None:
+        item = QtWidgets.QListWidgetItem("\u2500" * 28)
+        item.setData(_ROLE_IS_SEPARATOR, True)
+        item.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+        item.setForeground(QtGui.QColor("#475569"))
+        item.setSizeHint(QtCore.QSize(0, 14))
+        task_list.addItem(item)
+
     def _apply_refresh_snapshot(self, snapshot: _QuestListSnapshot) -> None:
         self._refreshing_lists = True
         try:
@@ -1316,29 +1363,45 @@ class QuestWidget(QtWidgets.QWidget):
 
             self.open_list.setUniformItemSizes(snapshot.use_compact)
             self.open_list.clear()
-            for task_id, number, title in snapshot.open_rows:
-                item = QtWidgets.QListWidgetItem(title)
-                item.setData(_ROLE_TASK_ID, task_id)
-                item.setData(_ROLE_QUEST_NUM, number)
-                item.setFlags(
-                    item.flags()
-                    | QtCore.Qt.ItemFlag.ItemIsUserCheckable
-                    | QtCore.Qt.ItemFlag.ItemIsEditable
+            self._add_list_section_header(self.open_list, _DAILY_SECTION_LABEL)
+            for task_id, number, title in snapshot.open_daily:
+                self._append_open_task_item(
+                    self.open_list,
+                    task_id=task_id,
+                    number=number,
+                    title=title,
+                    section="daily",
+                    use_compact=snapshot.use_compact,
                 )
-                item.setCheckState(QtCore.Qt.CheckState.Unchecked)
-                if not snapshot.use_compact:
-                    item.setSizeHint(self._size_hint_for_title(f"{number}. {title}"))
-                self.open_list.addItem(item)
+            self._add_list_section_separator(self.open_list)
+            for task_id, number, title in snapshot.open_normal:
+                self._append_open_task_item(
+                    self.open_list,
+                    task_id=task_id,
+                    number=number,
+                    title=title,
+                    section="normal",
+                    use_compact=snapshot.use_compact,
+                )
 
             self.done_list.setUniformItemSizes(snapshot.use_compact)
             self.done_list.clear()
-            for task_id, title in snapshot.done_rows:
-                item = QtWidgets.QListWidgetItem(title)
-                item.setData(QtCore.Qt.ItemDataRole.UserRole, task_id)
-                item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
-                if not snapshot.use_compact:
-                    item.setSizeHint(self._size_hint_for_title(title))
-                self.done_list.addItem(item)
+            self._add_list_section_header(self.done_list, _DAILY_SECTION_LABEL)
+            for task_id, title in snapshot.done_daily:
+                self._append_done_task_item(
+                    self.done_list,
+                    task_id=task_id,
+                    title=title,
+                    use_compact=snapshot.use_compact,
+                )
+            self._add_list_section_separator(self.done_list)
+            for task_id, title in snapshot.done_normal:
+                self._append_done_task_item(
+                    self.done_list,
+                    task_id=task_id,
+                    title=title,
+                    use_compact=snapshot.use_compact,
+                )
         except Exception as exc:
             log_diagnostic("ui", "refresh apply failed", exc=exc)
         finally:
@@ -1346,6 +1409,45 @@ class QuestWidget(QtWidgets.QWidget):
             self.done_list.blockSignals(False)
             self.setUpdatesEnabled(True)
             self._refreshing_lists = False
+
+    def _append_open_task_item(
+        self,
+        task_list: QtWidgets.QListWidget,
+        *,
+        task_id: int,
+        number: int,
+        title: str,
+        section: str,
+        use_compact: bool,
+    ) -> None:
+        item = QtWidgets.QListWidgetItem(title)
+        item.setData(_ROLE_TASK_ID, task_id)
+        item.setData(_ROLE_QUEST_NUM, number)
+        item.setData(_ROLE_QUEST_SECTION, section)
+        item.setFlags(
+            item.flags()
+            | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+            | QtCore.Qt.ItemFlag.ItemIsEditable
+        )
+        item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        if not use_compact:
+            item.setSizeHint(self._size_hint_for_title(f"{number}. {title}"))
+        task_list.addItem(item)
+
+    def _append_done_task_item(
+        self,
+        task_list: QtWidgets.QListWidget,
+        *,
+        task_id: int,
+        title: str,
+        use_compact: bool,
+    ) -> None:
+        item = QtWidgets.QListWidgetItem(title)
+        item.setData(_ROLE_TASK_ID, task_id)
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+        if not use_compact:
+            item.setSizeHint(self._size_hint_for_title(title))
+        task_list.addItem(item)
 
     def _refresh_now(self) -> None:
         """Legacy entry point — route through the async worker."""
@@ -1595,7 +1697,7 @@ class QuestWidget(QtWidgets.QWidget):
         if has_add_intent(text):
             return True
         if source == "typed":
-            return looks_like_typed_quest(text)
+            return looks_like_daily_typed_quest(text) or looks_like_typed_quest(text)
         return False
 
     def _apply_parser_actions(self, text: str, source: str) -> bool:
@@ -1614,6 +1716,38 @@ class QuestWidget(QtWidgets.QWidget):
                 self._apply_nonquest_llm_action(LLMAction(kind=action.kind, title=action.title))
                 if action.kind == "quit":
                     return True
+                continue
+
+            if action.kind == "add_daily":
+                titles = extract_daily_add_titles(item)
+                if not titles and action.title:
+                    titles = [action.title]
+                titles = [t for t in (normalize_quest_title(title) for title in titles) if t]
+
+                if titles:
+                    added = 0
+                    for title in titles:
+                        if self.db.add_daily_task(
+                            title,
+                            source=source,
+                            raw_input=action.raw,
+                        ) is not None:
+                            added += 1
+                    if not added:
+                        continue
+                    self.sfx.play("add")
+                    if added == 1:
+                        self._jarvis_say(
+                            f"Done, sir. I added the daily quest: {titles[0]}."
+                        )
+                    else:
+                        self._jarvis_say(f"Done, sir. I added {added} daily quests.")
+                    self._set_pending_add(False)
+                    self._set_footer_default()
+                else:
+                    self._set_pending_add(True)
+                    self.footer.setText('Say the daily quest, e.g. "daily brush teeth".')
+                    self._jarvis_say("Of course. Tell me the daily quest to repeat every day.")
                 continue
 
             if action.kind == "add":
@@ -1684,7 +1818,7 @@ class QuestWidget(QtWidgets.QWidget):
             return False
         if len(words) == 1 and words[0] in QuestWidget._VOICE_FILLER_WORDS:
             return False
-        if self._pending_voice_add or has_add_intent(text):
+        if self._pending_voice_add or has_add_intent(text) or has_daily_add_intent(text):
             return False
         if self._pending_voice_delete:
             return False
@@ -1761,10 +1895,16 @@ class QuestWidget(QtWidgets.QWidget):
         def worker() -> None:
             result = None
             try:
-                open_quests = [
-                    {"number": index, "title": task.title}
-                    for index, task in enumerate(db.list_tasks(status="open"), start=1)
-                ]
+                open_quests = []
+                buckets = db.list_quest_buckets()
+                for index, task in enumerate(buckets.open_daily, start=1):
+                    open_quests.append(
+                        {"number": index, "title": task.title, "section": "daily"}
+                    )
+                for index, task in enumerate(buckets.open_normal, start=1):
+                    open_quests.append(
+                        {"number": index, "title": task.title, "section": "normal"}
+                    )
                 fx = resolve_fx_enabled(text)
                 if parse_show_intent(text):
                     result = LLMResult(
@@ -2191,9 +2331,10 @@ class QuestWidget(QtWidgets.QWidget):
         *,
         title: Optional[str] = None,
         number: Optional[int] = None,
+        daily: Optional[bool] = None,
     ) -> Optional[Task]:
         if number is not None:
-            return self.db.get_open_task_by_number(number)
+            return self.db.get_open_task_by_number(number, daily=daily)
         if title:
             return self.db.find_best_open_by_title(title)
         return None
@@ -2207,12 +2348,17 @@ class QuestWidget(QtWidgets.QWidget):
         """
         Resolve 1-based open-task numbers and title needles against a single snapshot
         so multi-delete/complete by number does not shift indices mid-batch.
+        Numbers refer to the normal (non-daily) section when the section is ambiguous.
         """
-        open_tasks = self.db.list_tasks(status="open")
+        buckets = self.db.list_quest_buckets()
         ids: set[int] = set()
         for number in numbers:
-            if number is not None and 1 <= number <= len(open_tasks):
-                ids.add(open_tasks[number - 1].id)
+            if number is None:
+                continue
+            if 1 <= number <= len(buckets.open_normal):
+                ids.add(buckets.open_normal[number - 1].id)
+            elif 1 <= number <= len(buckets.open_daily):
+                ids.add(buckets.open_daily[number - 1].id)
         for title in titles:
             if not title:
                 continue
@@ -2229,7 +2375,7 @@ class QuestWidget(QtWidgets.QWidget):
     ) -> bool:
         task = self._resolve_open_quest(title=title, number=number)
         if task:
-            self.db.set_status(task.id, "done")
+            self.db.complete_task(task.id)
             self.sfx.play("complete")
             if number is not None:
                 self._jarvis_say(f"Task {number} completed: {task.title}.")
@@ -2258,7 +2404,11 @@ class QuestWidget(QtWidgets.QWidget):
             task = self.db.find_best_open_by_title(title)
 
         if task:
-            self.db.delete_task(task.id)
+            if not self.db.delete_task(task.id):
+                self.sfx.play("error")
+                self._jarvis_say("I could not delete that quest, sir.")
+                self._finish_quest_mutation()
+                return False
             self.sfx.play("delete")
             if number is not None:
                 self._jarvis_say(f"Task {number} deleted: {task.title}.")
@@ -2374,10 +2524,13 @@ class QuestWidget(QtWidgets.QWidget):
         return self._apply_nonquest_llm_action(LLMAction(kind=action.kind, title=action.title))
 
     def _open_quests_for_llm(self) -> list[dict[str, object]]:
-        return [
-            {"number": index, "title": task.title}
-            for index, task in enumerate(self.db.list_tasks(status="open"), start=1)
-        ]
+        buckets = self.db.list_quest_buckets()
+        quests: list[dict[str, object]] = []
+        for index, task in enumerate(buckets.open_daily, start=1):
+            quests.append({"number": index, "title": task.title, "section": "daily"})
+        for index, task in enumerate(buckets.open_normal, start=1):
+            quests.append({"number": index, "title": task.title, "section": "normal"})
+        return quests
 
     def _try_apply_casual_intent(self, text: str) -> bool:
         action = infer_casual_intent(text)
@@ -2583,7 +2736,7 @@ class QuestWidget(QtWidgets.QWidget):
                 titles=pending_complete_titles,
             )
             for task_id in complete_ids:
-                self.db.set_status(task_id, "done")
+                self.db.complete_task(task_id)
             if complete_ids:
                 completed = len(complete_ids)
                 handled = True
@@ -3181,9 +3334,11 @@ class QuestWidget(QtWidgets.QWidget):
             self._on_open_item_changed(item)
 
     def _on_open_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
+        if item.data(_ROLE_IS_SECTION) or item.data(_ROLE_IS_SEPARATOR):
+            return
         task_id = int(item.data(_ROLE_TASK_ID))
         if item.checkState() == QtCore.Qt.CheckState.Checked:
-            self.db.set_status(task_id, "done")
+            self.db.complete_task(task_id)
             self.sfx.play("complete")
             self.refresh()
             return
@@ -3205,17 +3360,40 @@ class QuestWidget(QtWidgets.QWidget):
             self._jarvis_say("No quest selected.")
             return
 
-        titles = [self._item_quest_title(item.text()) for item in items]
+        deleted_titles: list[str] = []
+        blocked_daily = 0
         for item in items:
-            task_id = int(item.data(QtCore.Qt.ItemDataRole.UserRole))
-            self.db.delete_task(task_id)
+            if item.data(_ROLE_IS_SECTION) or item.data(_ROLE_IS_SEPARATOR):
+                continue
+            task_id = int(item.data(_ROLE_TASK_ID))
+            if not self.db.can_delete_task(task_id):
+                blocked_daily += 1
+                continue
+            if self.db.delete_task(task_id):
+                deleted_titles.append(self._item_quest_title(item.text()))
 
-        if len(titles) == 1:
+        if blocked_daily and not deleted_titles:
+            self.sfx.play("error")
+            self._jarvis_say(
+                "Daily tasks can only be removed while they are open, sir."
+            )
+            return
+
+        if not deleted_titles:
+            self._jarvis_say("No quest selected.")
+            return
+
+        if blocked_daily:
+            self._jarvis_say(
+                "Daily tasks can only be removed while they are open, sir."
+            )
+
+        if len(deleted_titles) == 1:
             self.sfx.play("delete")
-            self._jarvis_say(f"Quest deleted: {titles[0]}.")
+            self._jarvis_say(f"Quest deleted: {deleted_titles[0]}.")
         else:
             self.sfx.play("delete")
-            self._jarvis_say(f"Deleted {len(titles)} quests, sir.")
+            self._jarvis_say(f"Deleted {len(deleted_titles)} quests, sir.")
         self.refresh()
 
     @staticmethod

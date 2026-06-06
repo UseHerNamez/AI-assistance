@@ -1,5 +1,5 @@
 #define MyAppName "Assistance"
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "Assistance"
 #define MyAppLauncher "launch_assistance.vbs"
 

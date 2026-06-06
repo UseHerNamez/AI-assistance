@@ -78,7 +78,7 @@ dist/
 .\build_all.ps1
 ```
 
-This refreshes both `dist\online\` and `dist\offline\` from the latest source.
+This refreshes `dist\online\` and `dist\offline\` from the latest source (currently **v0.2.0**). See `scripts\release_manifest.ps1` for the shared file list used by all build scripts.
 
 ## Setup (Windows PowerShell)
 

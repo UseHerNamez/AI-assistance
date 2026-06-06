@@ -7,10 +7,13 @@ from quest_assistant.monitor.logger import TimedRoute
 from quest_assistant.parser import (
     has_add_intent,
     has_complete_intent,
+    has_daily_add_intent,
     has_delete_intent,
     has_edit_intent,
     looks_like_delete_intent,
+    looks_like_daily_typed_quest,
     looks_like_listen_off,
+    looks_like_typed_quest,
     parse_fx_enabled,
     parse_hide_intent,
     parse_open_browser_intent,
@@ -21,7 +24,6 @@ from quest_assistant.parser import (
     parse_web_search_query,
     resolve_fx_enabled,
 )
-from quest_assistant.parser import looks_like_typed_quest
 from quest_assistant.events.sources.timers import parse_timer_request
 from quest_assistant.planner.detect import try_build_research_plan
 from quest_assistant.compose.detect import parse_compose_request, resolve_compose_request
@@ -175,7 +177,9 @@ class IntentRouter:
                 instant=True,
             )
 
-        if ctx.source == "voice" and ctx.jarvis_awake and (ctx.pending_add or has_add_intent(text)):
+        if ctx.source == "voice" and ctx.jarvis_awake and (
+            ctx.pending_add or has_add_intent(text) or has_daily_add_intent(text)
+        ):
             calls = parser_route.route_parser_actions(text, ctx)
             if calls:
                 timer.finish(kind="execute", tool_count=len(calls))
@@ -212,7 +216,9 @@ class IntentRouter:
                 instant=False,
             )
 
-        if ctx.source == "typed" and not looks_like_typed_quest(text):
+        if ctx.source == "typed" and not (
+            looks_like_typed_quest(text) or looks_like_daily_typed_quest(text)
+        ):
             timer.finish(kind="typed_hint", tool_count=0)
             return RouteDecision(
                 kind=RouteKind.TYPED_HINT,
@@ -237,7 +243,7 @@ class IntentRouter:
             return False
         if len(words) == 1 and words[0] in ctx.voice_filler_words:
             return False
-        if ctx.pending_add or has_add_intent(text):
+        if ctx.pending_add or has_add_intent(text) or has_daily_add_intent(text):
             return False
         if ctx.pending_delete:
             return False
@@ -288,7 +294,7 @@ class IntentRouter:
             or looks_like_memory_panel_intent(text)
         ):
             return False
-        if has_add_intent(text):
+        if has_add_intent(text) or has_daily_add_intent(text):
             return False
         from quest_assistant.parser import parse_action
 
@@ -303,6 +309,7 @@ class IntentRouter:
             "delete",
             "edit",
             "add",
+            "add_daily",
             "open_browser",
             "open_app",
             "open_url",
