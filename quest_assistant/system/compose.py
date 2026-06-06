@@ -7,7 +7,13 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from quest_assistant.system.launcher import _run_path, find_app_path
+from quest_assistant.system.launcher import (
+    _resolve_app_paths,
+    _run_path,
+    _shell_execute_app,
+    find_app_path,
+    open_document_with_default_app,
+)
 
 
 def compose_output_dir() -> Path:
@@ -42,19 +48,44 @@ def open_in_notepad(content: str, topic: str) -> tuple[bool, str]:
 
 
 def open_in_word(content: str, topic: str) -> tuple[bool, str]:
-    path = write_draft_file(content, topic, suffix="txt")
-    word_path = find_app_path("word")
-    if word_path:
+    rtf_body = content.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+    path = write_draft_file(
+        f"{{\\rtf1\\ansi\\deff0\\f0\\fs24 {rtf_body}\\par}}",
+        topic,
+        suffix="rtf",
+    )
+    if open_document_with_default_app(path):
+        return True, "I opened your draft in Word, sir."
+
+    word_exe = _resolve_app_paths("WINWORD.EXE")
+    if word_exe:
         try:
+            if _shell_execute_app(word_exe, str(path)):
+                return True, "I opened your draft in Word, sir."
+        except OSError:
+            pass
+
+    word_path = find_app_path("word")
+    if word_path and word_path.lower().endswith(".lnk"):
+        # Shortcuts cannot be passed to CreateProcess; ShellExecute opens Word without the file.
+        if _run_path(word_path):
+            return True, (
+                f"I opened Word and saved your draft as {path.name} "
+                r"in Documents\Jarvis, sir. Use File → Open to load it."
+            )
+    elif word_path:
+        try:
+            import subprocess
+            import sys as _sys
+
             subprocess.Popen(
                 [word_path, str(path)],
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                creationflags=subprocess.CREATE_NO_WINDOW if _sys.platform == "win32" else 0,
             )
             return True, "I opened your draft in Word, sir."
         except OSError:
             pass
-    if _run_path(str(path)):
-        return True, "I opened your draft, sir."
+
     return False, "I couldn't open Word, sir."
 
 

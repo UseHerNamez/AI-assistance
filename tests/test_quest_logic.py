@@ -34,6 +34,12 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(parse_quit_intent("shutdown"))
         self.assertTrue(parse_quit_intent("quit assistance"))
         self.assertTrue(parse_quit_intent("shutdown jarvis"))
+        self.assertTrue(parse_quit_intent("jarvis quit"))
+        self.assertTrue(parse_quit_intent("jarvis close"))
+        self.assertTrue(parse_quit_intent("jarvis goodbye"))
+        self.assertTrue(parse_quit_intent("goodbye"))
+        self.assertTrue(parse_quit_intent("with quit"))
+        self.assertFalse(parse_quit_intent("close memory"))
 
     def test_add_voice_command(self) -> None:
         action = parse_action("add wash dishes", allow_implicit_add=False)

@@ -19,9 +19,9 @@ class VoiceSTTConfig:
     # VAD / end-of-utterance
     vad_frame_ms: int = 30
     vad_silence_ms: int = 700
-    vad_min_speech_ms: int = 250
+    vad_min_speech_ms: int = 200
     vad_max_utterance_s: float = 18.0
-    vad_energy_threshold: float = 380.0  # RMS on int16 mono; raise if noisy room
+    vad_energy_threshold: float = 320.0  # RMS on int16 mono; raise if noisy room
 
     # Vosk
     vosk_model_path: Path | None = None
@@ -51,9 +51,9 @@ def load_voice_stt_config() -> VoiceSTTConfig:
         device=device,
         vad_frame_ms=int(os.environ.get("JARVIS_VAD_FRAME_MS", "30")),
         vad_silence_ms=int(os.environ.get("JARVIS_VAD_SILENCE_MS", "700")),
-        vad_min_speech_ms=int(os.environ.get("JARVIS_VAD_MIN_SPEECH_MS", "250")),
+        vad_min_speech_ms=int(os.environ.get("JARVIS_VAD_MIN_SPEECH_MS", "200")),
         vad_max_utterance_s=float(os.environ.get("JARVIS_VAD_MAX_UTTERANCE_S", "18")),
-        vad_energy_threshold=float(os.environ.get("JARVIS_VAD_ENERGY_THRESHOLD", "380")),
+        vad_energy_threshold=float(os.environ.get("JARVIS_VAD_ENERGY_THRESHOLD", "320")),
         vosk_model_path=vosk_path,
         whisper_model=os.environ.get("JARVIS_STT_WHISPER_MODEL", "tiny.en"),
         whisper_compute_type=os.environ.get("JARVIS_STT_WHISPER_COMPUTE", "int8"),

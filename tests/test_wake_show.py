@@ -11,6 +11,7 @@ from quest_assistant.parser import (
     parse_background_sleep_intent,
     parse_open_target,
     parse_show_intent,
+    resolve_show_command,
 )
 from quest_assistant.voice.listener import WakeWordGate
 
@@ -46,6 +47,19 @@ class ShowIntentTests(unittest.TestCase):
         self.assertIsNotNone(target)
         assert target is not None
         self.assertEqual(target[0], "url")
+
+    def test_asr_summon_variants(self) -> None:
+        cases = (
+            "harvey's open up",
+            "miss open up",
+            "obvious wake up",
+            "jarvis openness",
+            "jarvis open up",
+            "opened up",
+        )
+        for phrase in cases:
+            self.assertTrue(parse_show_intent(phrase), msg=phrase)
+            self.assertIsNotNone(resolve_show_command(phrase), msg=phrase)
 
 
 class WakeWordGateTests(unittest.TestCase):
@@ -117,6 +131,12 @@ class WakeWordGateTests(unittest.TestCase):
     def test_fuzzy_travis_alias(self) -> None:
         gate = WakeWordGate(wake_word="jarvis")
         self.assertEqual(gate.feed("travis open youtube", require_wake_word=True), "open youtube")
+
+    def test_asr_open_up_variants(self) -> None:
+        gate = WakeWordGate(wake_word="jarvis")
+        for spoken in ("harvey's open up", "miss open up", "jarvis openness"):
+            cmd = gate.feed(spoken, require_wake_word=True, background_mode=True)
+            self.assertEqual(cmd, "open up", msg=spoken)
 
 
 class BackgroundSleepTests(unittest.TestCase):

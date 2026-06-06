@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 import webbrowser
 from functools import lru_cache
@@ -104,6 +105,17 @@ _OFFICE_EXES = frozenset(
         "Teams.exe",
     }
 )
+
+# Friendly names → App Paths registry executable (desktop Office).
+_OFFICE_APP_EXES: dict[str, str] = {
+    "word": "WINWORD.EXE",
+    "microsoft word": "WINWORD.EXE",
+    "excel": "EXCEL.EXE",
+    "microsoft excel": "EXCEL.EXE",
+    "powerpoint": "POWERPNT.EXE",
+    "power point": "POWERPNT.EXE",
+    "microsoft powerpoint": "POWERPNT.EXE",
+}
 
 _RE_DOMAIN = re.compile(
     r"^[a-z0-9][\w-]*(?:\.[a-z0-9][\w-]*)+(?:/|$)",
@@ -250,28 +262,126 @@ def open_in_browser(url: str) -> bool:
         return False
 
 
-def launch_app(name: str) -> tuple[bool, str]:
+def launch_app(name: str, *, launch: bool = True) -> tuple[bool, str]:
     """Launch a desktop app by friendly name. Returns (ok, spoken_line)."""
     display = canonical_open_target(name) or (name or "").strip() or "that"
     if sys.platform != "win32":
         return False, "I can only launch apps on Windows, sir."
 
     if display == "outlook":
+        if not launch:
+            return True, "Opening Outlook."
         return launch_outlook()
+
+    office_exe = _OFFICE_APP_EXES.get(display.lower())
+    if office_exe:
+        if not launch:
+            return True, f"Opening {display}."
+        return launch_office_app(display, office_exe)
 
     path = find_app_path(display)
     if not path:
+        if not launch:
+            return False, f"I couldn't find {display} on this PC, sir."
         ok, spoken = open_url_or_site(display)
         if ok:
             return ok, spoken
         return False, f"I couldn't find {display} on this PC, sir."
 
-    if not _run_path(path):
+    if not launch:
+        return True, f"Opening {display}."
+
+    if not _launch_gui_path(path):
         ok, spoken = open_url_or_site(display)
         if ok:
             return ok, spoken
         return False, f"I couldn't launch {display}, sir."
     return True, f"Opening {display}."
+
+
+def open_document_with_default_app(path: Path) -> bool:
+    """Open a file the same way as double-clicking it in Explorer."""
+    if sys.platform != "win32":
+        return False
+    try:
+        os.startfile(str(path))  # noqa: S606
+        return True
+    except OSError:
+        return False
+
+
+def launch_office_app(display_name: str, exe_name: str) -> tuple[bool, str]:
+    """Launch Microsoft Office desktop apps via WINWORD.EXE-style paths."""
+    if sys.platform != "win32":
+        return False, "I can only launch apps on Windows, sir."
+
+    if exe_name in _OFFICE_DOCUMENT_STARTERS:
+        starter = _office_blank_starter(exe_name)
+        if open_document_with_default_app(starter):
+            return True, f"Opening {display_name}."
+
+    exe_path = (
+        _resolve_app_paths(exe_name)
+        or _search_program_files(exe_name, display_name)
+        or _where_exe(exe_name)
+    )
+    if exe_path and exe_name in _OFFICE_DOCUMENT_STARTERS:
+        starter = _office_blank_starter(exe_name)
+        try:
+            if _shell_execute_app(exe_path, str(starter)):
+                return True, f"Opening {display_name}."
+        except OSError:
+            pass
+
+    candidates: list[str] = []
+    for path in (
+        exe_path,
+        _best_start_menu_match(display_name),
+    ):
+        if path and path not in candidates:
+            candidates.append(path)
+
+    for path in candidates:
+        if _launch_gui_path(path):
+            return True, f"Opening {display_name}."
+
+    return False, f"I couldn't launch {display_name}, sir."
+
+
+_OFFICE_DOCUMENT_STARTERS: dict[str, tuple[str, str, str]] = {
+    "WINWORD.EXE": ("new_document", ".rtf", "{\\rtf1\\ansi\\deff0\\par}"),
+    "EXCEL.EXE": ("new_workbook", ".csv", ""),
+    "POWERPNT.EXE": ("new_presentation", ".rtf", "{\\rtf1\\ansi\\deff0\\par}"),
+}
+
+
+def _office_output_dir() -> Path:
+    path = Path.home() / "Documents" / "Jarvis"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _office_blank_starter(exe_name: str) -> Path:
+    """Create a tiny starter file — some Office installs only open when given a document."""
+    prefix, suffix, seed = _OFFICE_DOCUMENT_STARTERS.get(exe_name, ("new_file", ".txt", ""))
+    path = _office_output_dir() / f"{prefix}_{time.strftime('%Y%m%d_%H%M%S')}{suffix}"
+    path.write_text(seed, encoding="utf-8")
+    return path
+
+
+def _launch_gui_path(path: str) -> bool:
+    """Launch a Windows GUI app or shortcut reliably from python/pythonw."""
+    cleaned = (path or "").strip()
+    if not cleaned:
+        return False
+    lower = cleaned.lower()
+    if lower.endswith(".exe") and Path(cleaned).is_file():
+        try:
+            subprocess.Popen([cleaned])
+            return True
+        except OSError:
+            pass
+    return _run_path(cleaned)
 
 
 def launch_outlook() -> tuple[bool, str]:
@@ -309,6 +419,23 @@ def _shell_execute(path: str) -> bool:
     import ctypes
 
     result = ctypes.windll.shell32.ShellExecuteW(None, "open", path, None, None, 1)
+    return int(result) > 32
+
+
+def _shell_execute_app(executable: str, parameters: str = "") -> bool:
+    """Launch an executable with optional command-line parameters (Windows)."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "open",
+        executable,
+        parameters or None,
+        None,
+        1,
+    )
     return int(result) > 32
 
 
@@ -387,8 +514,12 @@ def _resolve_known_alias(alias: str, display_name: str) -> Optional[str]:
     if alias.upper() == "OUTLOOK.EXE":
         return _resolve_outlook_path(prefer_classic="classic" in display_name.lower())
 
-    # Start Menu shortcuts first for other Office apps — raw .exe can fail silently.
+    # Prefer the real .exe from App Paths — Start Menu .lnk shortcuts often
+    # report success from ShellExecute but fail to show a window from pythonw.
     if alias.upper() in _OFFICE_EXES:
+        path = _resolve_app_paths(alias)
+        if path:
+            return path
         menu = _best_start_menu_match(display_name)
         if menu:
             return menu

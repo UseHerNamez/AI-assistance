@@ -1441,6 +1441,10 @@ class QuestWidget(QtWidgets.QWidget):
             )
             self._complete_instant_command()
             return
+        if parse_quit_intent(text):
+            self._apply_nonquest_llm_action(LLMAction(kind="quit"))
+            self._complete_instant_command()
+            return
         if self._try_compose_command(text, source):
             return
 
@@ -2649,9 +2653,8 @@ class QuestWidget(QtWidgets.QWidget):
             self.state.jarvis_awake = True
             self._sync_voice_gate()
             self._set_pending_add(False)
-            if not self.isVisible():
-                self._show_pending = False
-                self._finish_show()
+            self._show_pending = False
+            self._finish_show()
             return True
 
         if action.kind == "hide":
@@ -2725,10 +2728,13 @@ class QuestWidget(QtWidgets.QWidget):
 
         if action.kind == "open_app":
             name = (action.value or action.title or "").strip()
-            ok, spoken = launch_app(name)
+            ok, spoken = launch_app(name, launch=False)
             self._jarvis_say(spoken)
             if ok:
-                self._after_speech_begins(lambda: self.sfx.play("show"), delay_ms=700)
+                self._after_speech_begins(
+                    lambda n=name: (launch_app(n, launch=True), self.sfx.play("show")),
+                    delay_ms=500,
+                )
             return True
 
         if action.kind == "open_url":

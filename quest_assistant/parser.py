@@ -157,6 +157,17 @@ _RE_QUIT = re.compile(
     r"(?:\s+(?:assistance|jarvis|the\s+app|application|now|please))?\s*$",
     re.IGNORECASE,
 )
+_RE_GOODBYE = re.compile(
+    r"^\s*(?:good\s*bye|goodbye|bye(?:\s+bye)?|see\s+you|farewell)"
+    r"(?:\s+(?:jarvis|assistance|sir|now|please))?\s*$",
+    re.IGNORECASE,
+)
+_RE_JARVIS_SHUTDOWN = re.compile(
+    r"\bjarvis\b.*\b(?:quit|exit|goodbye|good\s*bye|bye|shutdown|shut\s*down|close)\b|"
+    r"\b(?:quit|exit|goodbye|good\s*bye|bye|shutdown|shut\s*down|close)\b.*\bjarvis\b|"
+    r"\b(?:quit|exit|close|shutdown|shut\s*down)\s+(?:assistance|the\s+app|application)\b",
+    re.IGNORECASE,
+)
 _RE_SHUT_DOWN = re.compile(
     r"^\s*(?:please\s+|just\s+)?(?:shut\s*down|shutdown)"
     r"\s+(?:assistance|jarvis|the\s+app|application)(?:\s+(?:now|please))?\s*$",
@@ -496,13 +507,32 @@ def parse_hide_intent(text: str) -> bool:
     return any(pattern.search(raw) for pattern in _RE_HIDE_INTENTS)
 
 
+def _normalize_quit_phrase(text: str) -> str:
+    raw = normalize_voice_command(text)
+    asr_fixes = (
+        (r"\bwith quit\b", "quit"),
+        (r"\bjarvis good bye\b", "goodbye"),
+        (r"\bjarvis good-bye\b", "goodbye"),
+    )
+    for pattern, repl in asr_fixes:
+        raw = re.sub(pattern, repl, raw, flags=re.IGNORECASE)
+    return raw
+
+
 def parse_quit_intent(text: str) -> bool:
-    raw = (text or "").strip()
+    original = (text or "").strip()
+    if not original:
+        return False
+    if _RE_JARVIS_SHUTDOWN.search(original):
+        return True
+    raw = _normalize_quit_phrase(original)
     if not raw:
         return False
     if _RE_QUIT.match(raw):
         return True
     if _RE_SHUT_DOWN.match(raw):
+        return True
+    if _RE_GOODBYE.match(raw):
         return True
     return bool(_RE_QUIT_EXPLICIT.search(raw))
 
@@ -708,6 +738,67 @@ def parse_background_sleep_intent(text: str) -> bool:
     return bool(re.match(r"^\s*(?:sleep|go\s*away)\b", raw, re.IGNORECASE))
 
 
+_RE_SUMMON_ASR_FIXES = (
+    (r"\bharvey'?s?\s+open\s+up\b", "open up"),
+    (r"\bmiss\s+open\s+up\b", "open up"),
+    (r"\bobvious\s+wake\s+up\b", "wake up"),
+    (r"\bjarvis\s+openness\b", "open up"),
+    (r"\bopened\s+up\b", "open up"),
+    (r"\bopen\s+app\s*$", "open up"),
+    (r"\bup\s+open\b", "open up"),
+    (r"\bopen\s+up\s+please\b", "open up"),
+    (r"\bwake\s+up\s+please\b", "wake up"),
+)
+
+
+def _normalize_summon_asr(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    for pattern, repl in _RE_SUMMON_ASR_FIXES:
+        raw = re.sub(pattern, repl, raw, flags=re.IGNORECASE)
+    raw = normalize_voice_command(raw)
+    words = raw.split()
+    if len(words) <= 6:
+        lower = raw.lower()
+        if re.search(r"\bopen\s*up\b", lower) and parse_open_target(raw) is None:
+            return "open up"
+        if re.search(r"\b(?:wake\s*up|wakeup)\b", lower):
+            return "wake up"
+    return raw
+
+
+def resolve_show_command(text: str) -> Optional[str]:
+    """Return a normalized summon phrase when the user is trying to wake/show Jarvis."""
+    original = (text or "").strip()
+    if not original:
+        return None
+    from quest_assistant.memory.detect import looks_like_memory_panel_intent
+
+    if looks_like_memory_panel_intent(original):
+        return None
+
+    candidates: list[str] = []
+    for item in (original, normalize_voice_command(original), _normalize_summon_asr(original)):
+        cleaned = (item or "").strip()
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+
+    for candidate in candidates:
+        if not _matches_show(candidate):
+            continue
+        norm = normalize_voice_command(candidate)
+        if norm and _matches_show(norm):
+            if norm in {"open", "open up", "openup", "wake up", "wakeup"}:
+                return norm
+            return norm
+        lower = candidate.lower()
+        if lower in {"open", "open up", "openup", "wake up", "wakeup"}:
+            return lower
+        return "wake up"
+    return None
+
+
 def _matches_show(raw: str) -> bool:
     if not raw:
         return False
@@ -729,8 +820,7 @@ def _matches_show(raw: str) -> bool:
 
 
 def parse_show_intent(text: str) -> bool:
-    raw = normalize_voice_command(text)
-    return _matches_show(raw)
+    return resolve_show_command(text) is not None
 
 
 def parse_download_search_query(text: str) -> Optional[str]:

@@ -100,6 +100,57 @@ class ComposeFileTests(unittest.TestCase):
         path.unlink(missing_ok=True)
 
 
+class ComposeDeliveryTests(unittest.TestCase):
+    def test_open_in_word_uses_winword_not_notepad_fallback(self) -> None:
+        from unittest.mock import patch
+
+        from quest_assistant.system.compose import open_in_word
+
+        with (
+            patch("quest_assistant.system.compose.write_draft_file") as write_mock,
+            patch("quest_assistant.system.compose.open_document_with_default_app") as open_mock,
+            patch("quest_assistant.system.compose._resolve_app_paths") as resolve_mock,
+            patch("quest_assistant.system.compose._shell_execute_app") as shell_mock,
+            patch("quest_assistant.system.compose._run_path") as run_mock,
+        ):
+            from pathlib import Path
+
+            draft = Path("C:/Users/test/Documents/Jarvis/draft.rtf")
+            write_mock.return_value = draft
+            open_mock.return_value = True
+
+            ok, spoken = open_in_word("Long essay body.", "renewable energy")
+
+        self.assertTrue(ok)
+        self.assertIn("Word", spoken)
+        open_mock.assert_called_once_with(draft)
+        write_mock.assert_called_once()
+        resolve_mock.assert_not_called()
+        shell_mock.assert_not_called()
+        run_mock.assert_not_called()
+
+    def test_open_in_word_does_not_open_txt_when_word_missing(self) -> None:
+        from unittest.mock import patch
+
+        from quest_assistant.system.compose import open_in_word
+
+        with (
+            patch("quest_assistant.system.compose.write_draft_file") as write_mock,
+            patch("quest_assistant.system.compose.open_document_with_default_app", return_value=False),
+            patch("quest_assistant.system.compose._resolve_app_paths", return_value=None),
+            patch("quest_assistant.system.compose.find_app_path", return_value=None),
+            patch("quest_assistant.system.compose._run_path") as run_mock,
+        ):
+            from pathlib import Path
+
+            write_mock.return_value = Path("C:/Users/test/Documents/Jarvis/draft.rtf")
+            ok, spoken = open_in_word("Body.", "topic")
+
+        self.assertFalse(ok)
+        self.assertIn("Word", spoken)
+        run_mock.assert_not_called()
+
+
 class ComposeUiTests(unittest.TestCase):
     def test_ui_widget_imports_compose_request(self) -> None:
         import quest_assistant.ui_widget as ui_widget

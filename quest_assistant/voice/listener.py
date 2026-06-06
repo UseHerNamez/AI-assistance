@@ -95,17 +95,9 @@ class WakeWordGate:
         return remainder or None
 
     def _show_wake_command(self, raw: str) -> Optional[str]:
-        from quest_assistant.memory.detect import looks_like_memory_panel_intent
-        from quest_assistant.parser import normalize_voice_command, parse_show_intent
+        from quest_assistant.parser import resolve_show_command
 
-        if looks_like_memory_panel_intent(raw):
-            return None
-        if not parse_show_intent(raw):
-            return None
-        norm = normalize_voice_command(raw)
-        if norm and parse_show_intent(norm):
-            return norm
-        return "wake up"
+        return resolve_show_command(raw)
 
     def feed(
         self,
@@ -141,6 +133,11 @@ class WakeWordGate:
 
         if now <= self._armed_until:
             return raw
+
+        if require_wake_word and re.search(
+            r"\b(?:open\s*up|wake\s*up|wakeup|jarvis|jervis|show\s+up)\b", raw, re.IGNORECASE
+        ):
+            log_voice(f"wake_gate dropped possible summon {raw!r}")
 
         return None
 

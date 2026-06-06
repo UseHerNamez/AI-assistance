@@ -125,5 +125,38 @@ class LauncherUrlTests(unittest.TestCase):
             self.assertTrue(path.lower().endswith((".lnk", ".exe")))
 
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows-only")
+    def test_find_word_prefers_exe_over_lnk(self) -> None:
+        from quest_assistant.system.launcher import find_app_path
+
+        path = find_app_path("word")
+        if path is None:
+            self.skipTest("Word not installed")
+        self.assertTrue(path.lower().endswith(".exe"), path)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows-only")
+    def test_launch_word_opens_blank_document(self) -> None:
+        from unittest.mock import patch
+
+        from quest_assistant.system.launcher import launch_app
+
+        with (
+            patch("quest_assistant.system.launcher._office_blank_starter") as starter_mock,
+            patch("quest_assistant.system.launcher.open_document_with_default_app") as open_mock,
+            patch("quest_assistant.system.launcher._launch_gui_path") as launch_mock,
+        ):
+            from pathlib import Path
+
+            starter = Path(r"C:\Users\test\Documents\Jarvis\new_document_20260101_120000.rtf")
+            starter_mock.return_value = starter
+            open_mock.return_value = True
+            ok, spoken = launch_app("word", launch=True)
+
+        self.assertTrue(ok)
+        self.assertIn("word", spoken.lower())
+        open_mock.assert_called_once_with(starter)
+        launch_mock.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
